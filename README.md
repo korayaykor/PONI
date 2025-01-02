@@ -79,14 +79,14 @@ export PYTHONPATH=$PYTHONPATH:$PONI_ROOT
 
 1. Download [Gibson](http://gibsonenv.stanford.edu/database/) and [Matterport3D](https://niessner.github.io/Matterport/) scenes following the instructions [here](DATASETS.md).
 
-2. Extract Gibson and MP3D semantic maps.
+2. Extract Gibson and MP3D semantic maps.(done)
     ```
     cd $PONI_ROOT
     ACTIVE_DATASET="gibson" python scripts/create_semantic_maps.py
     ACTIVE_DATASET="mp3d" python scripts/create_semantic_maps.py
     ```
 
-3. Create dataset for PONI training. </br>
+3. Create dataset for PONI training. </br>(done)
     a. First extract FMM distances for all objects in each map.
     ```
     cd $PONI_ROOT
@@ -191,3 +191,6 @@ If you find this codebase useful, please cite us:
 
 ## License
 This project is released under the MIT license, as found in the [LICENSE](LICENSE) file.
+
+## To-Do List
+Dockerize this repo.
