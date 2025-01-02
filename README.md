@@ -27,12 +27,11 @@ Clone the current repo and required submodules:
 git clone git@github.com:srama2512/PONI.git
 cd PONI
 git submodule init
-git submodule update
 export PONI_ROOT=<PATH TO PONI/>
 ```
  Create a conda environment:
 ```
-conda create --name poni python=3.8.5
+conda create --name poni python=3.9
 conda activate poni
 ```
 
@@ -43,17 +42,23 @@ conda install pytorch==1.9.1 torchvision==0.10.1 torchaudio==0.9.1 cudatoolkit=1
 
 Install dependencies:
 ```
-cd $PONI_ROOT/dependencies/habitat-lab
-pip install -r requirements.txt
-python setup.py develop --all
+cd $PONI_ROOT/dependencies
 
-cd $PONI_ROOT/dependencies/habitat-sim
-pip install -r requirements.txt
-python setup.py install --headless --with-cuda
+git clone https://github.com/srama2512/astar_pycpp.git
 
-python -m pip install detectron2 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html
+git clone https://github.com/facebookresearch/habitat-sim.git
+cd habitat-sim; git checkout tags/challenge-2022; 
+pip install -r requirements.txt; 
+python setup.py install --headless #or --all
 
-pip install torch-scatter -f https://data.pyg.org/whl/torch-1.9.0+cu102.html
+cd $PONI_ROOT/dependencies
+git clone https://github.com/facebookresearch/habitat-lab.git
+cd habitat-lab; git checkout tags/challenge-2022; 
+pip install -e .
+
+python -m pip install detectron2==0.5 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html
+
+python -m pip install torch-scatter==2.0.7 -f https://pytorch-geometric.com/whl/torch-1.9.1+cu102.html
 
 cd $PONI_ROOT/dependencies/astar_pycpp && make
 ```
