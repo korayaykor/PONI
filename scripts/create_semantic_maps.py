@@ -325,7 +325,7 @@ def extract_wall_point_clouds(
         floor_x_disc = np.around(floor_pc[:, 0] / grid_size).astype(np.int32)
         floor_z_disc = np.around(floor_pc[:, 2] / grid_size).astype(np.int32)
         floor_y = floor_pc[:, 1]
-        mask = np.zeros(floor_y.shape[0], dtype=np.bool)
+        mask = np.zeros(floor_y.shape[0], dtype=np.bool_)
         for i, (x_disc, z_disc, y) in enumerate(
             zip(floor_x_disc, floor_z_disc, floor_y)
         ):
