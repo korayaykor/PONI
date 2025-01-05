@@ -44,7 +44,7 @@ Install dependencies:
 ```
 cd $PONI_ROOT/dependencies
 
-git clone https://github.com/srama2512/astar_pycpp.git
+
 
 git clone https://github.com/facebookresearch/habitat-sim.git
 cd habitat-sim; git checkout tags/challenge-2022; 
@@ -59,7 +59,7 @@ pip install -e .
 python -m pip install detectron2==0.5 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html
 
 python -m pip install torch-scatter==2.0.7 -f https://pytorch-geometric.com/whl/torch-1.9.1+cu102.html
-
+git clone https://github.com/srama2512/astar_pycpp.git
 cd $PONI_ROOT/dependencies/astar_pycpp && make
 ```
 
