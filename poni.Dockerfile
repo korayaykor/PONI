@@ -92,5 +92,12 @@ RUN cd $PONI_ROOT && \
 RUN conda init bash && \
     echo "conda activate poni" >> ~/.bashrc
 
+# Download Matterport3D dataset
+COPY download_mp.py /tmp/download_mp.py
+RUN cd $PONI_ROOT && \
+    python /tmp/download_mp.py --task_data habitat -o $PONI_ROOT/data/scene_datasets/mp3d && \
+    mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
+    unzip v1/tasks/mp3d_habitat.zip -d $PONI_ROOT/data/scene_datasets/mp3d
+
 # Default command
 CMD ["/bin/bash"]
