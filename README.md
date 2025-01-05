@@ -43,6 +43,8 @@ conda install pytorch==1.9.1 torchvision==0.10.1 torchaudio==0.9.1 cudatoolkit=1
 
 Install dependencies:
 ```
+pip install cmake
+
 cd $PONI_ROOT/dependencies/habitat-lab
 pip install -r requirements.txt
 python setup.py develop --all
