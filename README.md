@@ -28,8 +28,15 @@ after building image , run with the command below
 ```
 docker run -dit poni:test bash
 ```
-
-
+after attaching the container
+```
+cd PONI/data/scene_datasets/mp3d
+python download_mp.py --task_data habitat -o .
+```
+After download is finished unzip the files into 
+```
+unzip habitat_task.zip -d $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
+```
 ## Installation
 
 Clone the current repo and required submodules:
