@@ -97,7 +97,8 @@ COPY download_mp.py /tmp/download_mp.py
 RUN cd $PONI_ROOT && \
     python /tmp/download_mp.py --task_data habitat -o $PONI_ROOT/data/scene_datasets/mp3d && \
     mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
-    unzip v1/tasks/mp3d_habitat.zip -d $PONI_ROOT/data/scene_datasets/mp3d
+    mkdir -p $PONI_ROOT/data/scene_datasets/mp3d_uncompressed && \
+    unzip v1/tasks/mp3d_habitat.zip -d $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
 
 # Default command
 CMD ["/bin/bash"]
