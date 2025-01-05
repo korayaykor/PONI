@@ -24,7 +24,7 @@ State-of-the-art approaches to ObjectGoal navigation rely on reinforcement learn
 
 Clone the current repo and required submodules:
 ```
-git clone git@github.com:srama2512/PONI.git
+git clone https://github.com/korayaykor/PONI.git
 cd PONI
 git submodule init
 export PONI_ROOT=<PATH TO PONI/>
