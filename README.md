@@ -17,7 +17,17 @@ State-of-the-art approaches to ObjectGoal navigation rely on reinforcement learn
   <img src="docs/poni_intro.jpg">
 </p>
 
+## Docker Installation
 
+download docker file locally. add same directory the download_mp.py file.
+Run with 
+```
+docker build -f poni.dockerfile -t poni:test .
+```
+after building image , run with the command below
+```
+docker run -dit poni:test bash
+```
 
 
 ## Installation
