@@ -55,6 +55,7 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     wget \
     ninja-build \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Setup Habitat-sim
@@ -88,17 +89,16 @@ RUN cd $PONI_ROOT/dependencies && \
 RUN cd $PONI_ROOT && \
     pip install -r requirements.txt
 
+# Setup directory structure and download script
+RUN mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
+    mkdir -p $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
+
+# Copy download script
+COPY download_mp.py $PONI_ROOT/data/scene_datasets/mp3d/download_mp.py
+
 # Initialize conda in bash so it's available in interactive sessions
 RUN conda init bash && \
     echo "conda activate poni" >> ~/.bashrc
-
-# Download Matterport3D dataset
-COPY download_mp.py /tmp/download_mp.py
-RUN cd $PONI_ROOT && \
-    python /tmp/download_mp.py --task_data habitat -o $PONI_ROOT/data/scene_datasets/mp3d && \
-    mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
-    mkdir -p $PONI_ROOT/data/scene_datasets/mp3d_uncompressed && \
-    unzip v1/tasks/mp3d_habitat.zip -d $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
 
 # Default command
 CMD ["/bin/bash"]
