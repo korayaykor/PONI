@@ -1,6 +1,12 @@
-FROM ubuntu:20.04
+# Base image with NVIDIA CUDA support
+FROM nvidia/cudagl:10.1-devel-ubuntu18.04
 
-# Avoid timezone prompt during package installation
+# Add NVIDIA GPG keys and repositories
+RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub && \
+    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub && \
+    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64 /" > /etc/apt/sources.list.d/cuda.list && \
+    echo "deb https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64 /" > /etc/apt/sources.list.d/nvidia-ml.list
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Set working directory and environment variable
@@ -17,8 +23,24 @@ RUN apt-get update && \
     apt-get install -y cmake && \
     apt-get install -y gcc g++ && \
     apt-get install -y python3-dev && \
+    apt-get install -y python3-pip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# Remove old cmake
+RUN apt-get remove --purge -y cmake
+
+# Install a newer CMake from Kitware
+RUN apt-get update && apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
+    software-properties-common && \
+    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | apt-key add - && \
+    apt-add-repository 'deb https://apt.kitware.com/ubuntu/ bionic main' && \
+    apt-get update && apt-get install -y cmake
+
+# Now your cmake is >= 3.12
 
 # Install Miniconda
 RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
@@ -93,12 +115,11 @@ RUN cd $PONI_ROOT && \
 RUN mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
     mkdir -p $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
 
-# Copy download script
-COPY download_mp.py $PONI_ROOT/data/scene_datasets/mp3d/download_mp.py
-
 # Initialize conda in bash so it's available in interactive sessions
 RUN conda init bash && \
     echo "conda activate poni" >> ~/.bashrc
+
+
 
 # Default command
 CMD ["/bin/bash"]
