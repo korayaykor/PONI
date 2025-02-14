@@ -26,7 +26,9 @@ docker build -f poni.dockerfile -t poni:test .
 ```
 after building image , run with the command below
 ```
-docker run -dit poni:test bash
+#not this anymore
+#docker run -dit poni:test bash
+run -dit -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -v /home/emir/.Xauthority:/root/.Xauthority --net=host --runtime nvidia --gpus all poni:test
 ```
 after attaching the container
 ```
