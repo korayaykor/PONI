@@ -1,8 +1,8 @@
 #!/bin/bash
 
 EXPT_ROOT=$PWD
-
-conda activate poni
+#conda already activated.
+#conda activate poni
 
 cd $PONI_ROOT
 
