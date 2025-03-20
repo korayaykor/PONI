@@ -1,5 +1,5 @@
-# Base image with NVIDIA CUDA support
-FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu20.04
+# Base image with NVIDIA CUDA support - Updated for RTX 4500 ADA
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -40,8 +40,6 @@ RUN apt-get update && apt-get install -y \
     apt-add-repository 'deb https://apt.kitware.com/ubuntu/ bionic main' && \
     apt-get update && apt-get install -y cmake
 
-# Now your cmake is >= 3.12
-
 # Install Miniconda
 RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
     chmod +x /tmp/miniconda.sh && \
@@ -51,7 +49,7 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -
 # Fix ENV syntax
 ENV PATH=/opt/conda/bin:$PATH
 
-# Install NVIDIA repository and tools
+# Install NVIDIA repository and tools - Updated for newer drivers compatible with RTX 4500 ADA
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -60,18 +58,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64 /" > /etc/apt/sources.list.d/cuda.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-    nvidia-utils-470 \
-    nvidia-driver-470 \
-    cuda-toolkit-11-4
+    nvidia-utils-535 \
+    nvidia-driver-535
 
 # Create conda environment
-RUN conda create -n poni python=3.9 -y
+RUN conda create -n poni python=3.10 -y
 
 # Make RUN commands use the new environment
 SHELL ["conda", "run", "-n", "poni", "/bin/bash", "-c"]
 
-# Install PyTorch and dependencies
-RUN conda install pytorch==1.9.1 torchvision==0.10.1 torchaudio==0.9.1 cudatoolkit=10.2 -c pytorch -y
+# Install PyTorch and dependencies - Updated for CUDA 12.1 compatibility
+RUN conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
 # Clone PONI repository and initialize submodules
 RUN git clone https://github.com/korayaykor/PONI.git && \
@@ -93,13 +90,13 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Setup Habitat-sim
+# Setup Habitat-sim with updated CUDA flags
 RUN cd $PONI_ROOT/dependencies && \
     git clone https://github.com/facebookresearch/habitat-sim.git && \
     cd habitat-sim && \
     git checkout tags/challenge-2022 && \
     pip install -r requirements.txt && \
-    HEADLESS=True python setup.py install
+    HEADLESS=True CUDA_HOME=/usr/local/cuda python setup.py install
 
 # Setup Habitat-lab
 RUN cd $PONI_ROOT/dependencies && \
@@ -108,11 +105,9 @@ RUN cd $PONI_ROOT/dependencies && \
     git checkout tags/challenge-2022 && \
     pip install -e .
 
-# Install ML dependencies
-RUN python -m pip install detectron2==0.5 \
-    -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html && \
-    python -m pip install torch-scatter==2.0.7 \
-    -f https://pytorch-geometric.com/whl/torch-1.9.1+cu102.html
+# Install ML dependencies - Updated for PyTorch 2.1 and CUDA 12.1
+RUN pip install 'git+https://github.com/facebookresearch/detectron2.git' && \
+    pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
 
 # Setup A* implementation
 RUN cd $PONI_ROOT/dependencies && \
@@ -124,7 +119,7 @@ RUN cd $PONI_ROOT/dependencies && \
 RUN cd $PONI_ROOT && \
     pip install -r requirements.txt
 
-# Setup directory structure and download script
+# Setup directory structure
 RUN mkdir -p $PONI_ROOT/data/scene_datasets/mp3d && \
     mkdir -p $PONI_ROOT/data/scene_datasets/mp3d_uncompressed
 
