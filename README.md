@@ -129,7 +129,7 @@ To train models for PONI, predict-xy, predict-theta, and predict-action methods,
 ```
 mkdir -p $PONI_ROOT/experiments/poni/
 cd $PONI_ROOT/experiments/poni
-cp $PONI_ROOT/experiment_scripts/gibson/train_poni.sh .
+cp $PONI_ROOT/experiment_scripts/mp3d/train_poni.sh .
 chmod +x train_poni.sh
 ./train_poni.sh
 ```
