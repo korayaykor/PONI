@@ -1,11 +1,11 @@
 #!/bin/bash
 
 EXPT_ROOT=$PWD
-#conda already activated.
+
 #conda activate poni
 
 cd $PONI_ROOT
-
+CUDA_VISIBLE_DEVICES=0
 python -W ignore -u -m torch.distributed.launch \
   --use_env \
   --nproc_per_node=2 \
