@@ -313,8 +313,9 @@ class SemanticMapperModule(nn.Module):
             self.train_dataset,
             batch_size=self.cfg.OPTIM.batch_size,
             shuffle=(self.train_sampler is None),
-            num_workers=self.cfg.OPTIM.num_workers,
-            pin_memory=True,
+            num_workers=0,
+            #num_workers=self.cfg.OPTIM.num_workers,
+            pin_memory=False,  # True yerine False kullanın
             sampler=self.train_sampler,
             collate_fn=collate_fn,
         )
@@ -326,7 +327,7 @@ class SemanticMapperModule(nn.Module):
             self.val_dataset,
             batch_size=self.cfg.OPTIM.batch_size,
             num_workers=self.cfg.OPTIM.num_workers,
-            pin_memory=True,
+            pin_memory=False,  # True yerine False kullanın
             collate_fn=collate_fn,
         )
         return self.val_loader
@@ -390,7 +391,19 @@ class SemanticMapperModule(nn.Module):
     def get_pf_cfg(self):
         return {"dthresh": self.cfg.DATASET.object_pf_cutoff_dist}
 
-
+def get_safe_device_id(local_rank):
+    """Güvenli bir şekilde cihaz ID'si döndürür, geçersiz erişimi önler."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        return torch.device("cpu")
+    
+    # Mod operatörü kullanarak güvenli bir şekilde GPU seçin
+    safe_id = local_rank % num_gpus
+    return torch.device(f"cuda:{safe_id}")
+    
 class Trainer:
     DEFAULT_PORT = 8738
     DEFAULT_PORT_RANGE = 127
@@ -398,7 +411,7 @@ class Trainer:
 
     def __init__(self, cfg):
         self.cfg = cfg
-
+        #self.is_distributed = False
         self.is_distributed = self.get_distrib_size()[2] > 1
 
         # Setup DDP
