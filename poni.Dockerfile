@@ -67,8 +67,14 @@ RUN conda create -n poni python=3.10 -y
 # Make RUN commands use the new environment
 SHELL ["conda", "run", "-n", "poni", "/bin/bash", "-c"]
 
+# Pin NumPy to 1.x version to avoid compatibility issues with PyTorch
+RUN conda install numpy=1.25.2 -y
+
 # Install PyTorch and dependencies - Updated for CUDA 12.1 compatibility
 RUN conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+
+# Make sure numpy stays at 1.x after PyTorch installation
+RUN pip install "numpy<2.0.0" --force-reinstall
 
 # Clone PONI repository and initialize submodules
 RUN git clone https://github.com/korayaykor/PONI.git && \
