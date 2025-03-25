@@ -5,10 +5,10 @@ EXPT_ROOT=$PWD
 #conda activate poni
 
 cd $PONI_ROOT
-CUDA_VISIBLE_DEVICES=0
+#CUDA_VISIBLE_DEVICES=1
 python -W ignore -u -m torch.distributed.launch \
   --use_env \
-  --nproc_per_node=2 \
+  --nproc_per_node=1 \
   train.py \
     LOGGING.ckpt_dir "$EXPT_ROOT/checkpoints" \
     LOGGING.tb_dir "$EXPT_ROOT/tb" \
@@ -19,5 +19,5 @@ python -W ignore -u -m torch.distributed.launch \
     DATASET.object_pf_cutoff_dist 5.0 \
     DATASET.normalize_area_by_constant True \
     DATASET.max_unexp_area 40.0 \
-    OPTIM.batch_size 16 \
+    OPTIM.batch_size 32 \
     MODEL.num_categories 23
