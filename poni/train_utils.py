@@ -57,7 +57,7 @@ def collate_fn(batch):
                 # Eski PyTorch sürümleriyle geriye uyumluluk
                 storage = elem.storage()._new_shared(numel)
                 out = elem.new(storage)
-        return torch.stack(batch, 0, out=out)
+        return torch.stack(batch, 0)
     elif (
         elem_type.__module__ == "numpy"
         and elem_type.__name__ != "str_"
