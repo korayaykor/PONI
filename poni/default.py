@@ -37,7 +37,7 @@ _C.OPTIM = CN()
 _C.OPTIM.lr = 1e-3
 _C.OPTIM.num_total_updates = 40000
 _C.OPTIM.batch_size = 20
-_C.OPTIM.num_workers = 8
+_C.OPTIM.num_workers = 0
 _C.OPTIM.lr_sched_milestones = [
     2,
 ]

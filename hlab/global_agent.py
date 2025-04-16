@@ -80,7 +80,7 @@ class GlobalAgent(object):
         self.time_benchmarks = defaultdict(lambda: deque(maxlen=50))
         # Visualization
         if cfg.GLOBAL_AGENT.visualize:
-            self.legend = cv2.imread(f"../docs/legend_{self.dataset}.png")
+            self.legend = cv2.imread(f"../semexp/docs/legend_{self.dataset}.png")
             if self.dataset == "gibson":
                 self.color_palette = [int(x * 255.0) for x in gibson_palette]
             else:
