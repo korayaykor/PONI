@@ -92,8 +92,17 @@ Add repository to python path:
 ```
 export PYTHONPATH=$PYTHONPATH:$PONI_ROOT
 ```
+## UPLOADING semantic map datasets and datasets
 
+copy the mp3d data
+```
+docker cp ~/v1/tasks/mp3d_uncompressed "container-id":/app/PONI/data/scene_datasets
+```
 
+copy precomputed data
+```
+docker cp ~/mp3d "container-id":/app/PONI/data/semantic_maps/mp3d
+```
 ## Creating semantic map datasets
 
 1. Download [Gibson](http://gibsonenv.stanford.edu/database/) and [Matterport3D](https://niessner.github.io/Matterport/) scenes following the instructions [here](DATASETS.md).

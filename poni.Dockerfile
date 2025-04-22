@@ -76,6 +76,9 @@ RUN conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-c
 # Make sure numpy stays at 1.x after PyTorch installation
 RUN pip install "numpy<2.0.0" --force-reinstall
 
+# Fix protobuf compatibility issues with TensorBoard
+RUN pip install protobuf==3.20.3 --force-reinstall
+
 # Clone PONI repository and initialize submodules
 RUN git clone https://github.com/korayaykor/PONI.git && \
     cd PONI && \
