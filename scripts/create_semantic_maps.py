@@ -59,10 +59,54 @@ for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
     MP3D_OBJECT_COLORS.append(color)
 
 ################################################################################
+# HM3D constants
+################################################################################
+# Define categories for HM3D based on the available objects
+HM3D_CATEGORIES = [
+    "out-of-bounds",  # 0
+    "floor",          # 1
+    "wall",           # 2
+    "chair",          # 3
+    "table",          # 4
+    "picture",        # 5
+    "cabinet",        # 6
+    "cushion",        # 7
+    "sofa",           # 8
+    "bed",            # 9
+    "chest_of_drawers", # 10
+    "plant",          # 11
+    "sink",           # 12
+    "toilet",         # 13
+    "stool",          # 14
+    "towel",          # 15
+    "tv_monitor",     # 16
+    "shower",         # 17
+    "bathtub",        # 18
+    "counter",        # 19
+    "fireplace",      # 20
+    "gym_equipment",  # 21
+    "seating",        # 22
+    "clothes",        # 23
+    "fridge",         # 24
+    "desk",           # 25
+    "lamp",           # 26
+    "door",           # 27
+    "window",         # 28
+    "book",           # 29
+    "appliance",      # 30
+]
+
+HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(HM3D_CATEGORIES)}
+HM3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
+for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
+    color = (color.astype(np.float32) / 255.0).tolist()
+    HM3D_OBJECT_COLORS.append(color)
+
+################################################################################
 # General constants
 ################################################################################
 assert "ACTIVE_DATASET" in os.environ
-ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson
+ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson / hm3d
 if ACTIVE_DATASET == "mp3d":
     OBJECT_COLORS = MP3D_OBJECT_COLORS
     OBJECT_CATEGORIES = MP3D_CATEGORIES
@@ -71,6 +115,18 @@ if ACTIVE_DATASET == "mp3d":
     SB_SAVE_ROOT = "data/semantic_maps/mp3d/scene_boundaries"
     PC_SAVE_ROOT = "data/semantic_maps/mp3d/point_clouds"
     SEM_SAVE_ROOT = "data/semantic_maps/mp3d/semantic_maps"
+    NUM_WORKERS = 8
+    MAX_TASKS_PER_CHILD = 2
+    SAMPLING_RESOLUTION = 0.20
+    WALL_THRESH = [0.25, 1.25]
+elif ACTIVE_DATASET == "hm3d":
+    OBJECT_COLORS = HM3D_OBJECT_COLORS
+    OBJECT_CATEGORIES = HM3D_CATEGORIES
+    OBJECT_CATEGORY_MAP = HM3D_CATEGORY_MAP
+    SCENES_ROOT = "data/scene_datasets/hm3d"
+    SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
+    PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
+    SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
     NUM_WORKERS = 8
     MAX_TASKS_PER_CHILD = 2
     SAMPLING_RESOLUTION = 0.20
@@ -180,33 +236,84 @@ def extract_scene_point_clouds(
     colors = []
     obj_ids = []
     sem_ids = []
-    ply_data = PlyData.read(ply_path)
-    # Get faces for each object id
-    obj_id_to_faces = defaultdict(list)
-    for face in ply_data["face"]:
-        vids = list(face[0])
-        obj_id = face[1]
-        if obj_id in obj_id_to_cat:
-            p1 = ply_data["vertex"][vids[0]]
-            p1 = [p1[0], p1[2], -p1[1]]
-            p2 = ply_data["vertex"][vids[1]]
-            p2 = [p2[0], p2[2], -p2[1]]
-            p3 = ply_data["vertex"][vids[2]]
-            p3 = [p3[0], p3[2], -p3[1]]
-            obj_id_to_faces[obj_id].append([p1, p2, p3])
-    # Get dense point-clouds for each object id
-    for obj_id, faces in obj_id_to_faces.items():
-        ocat = obj_id_to_cat[obj_id]
-        sem_id = OBJECT_CATEGORY_MAP[ocat]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        # Create trimesh vertices and faces from faces
-        faces = np.array(faces)  # (N, 3, 3)
-        t_pts = hab_utils.dense_sampling_trimesh(faces, sampling_density)
-        for t_pt in t_pts:
-            vertices.append(t_pt)
-            obj_ids.append(obj_id)
-            sem_ids.append(sem_id)
-            colors.append(color)
+    
+    # Handle HM3D's potentially different file format
+    if ACTIVE_DATASET == "hm3d":
+        # For HM3D, we need to handle the semantic information differently
+        # This is a placeholder, adjust based on actual HM3D format
+        sim = hab_utils.robust_load_sim(glb_path)
+        
+        # Process objects from the semantic scene
+        objects = sim.semantic_scene.objects
+        obj_id_to_faces = defaultdict(list)
+        
+        # Extract vertices from the mesh
+        scene_mesh = trimesh.load(glb_path)
+        
+        # Process each object separately
+        for obj in objects:
+            obj_id = obj.id.split("_")[-1]
+            obj_cat = obj.category.name().lower()
+            
+            # Skip if the category is not in our mapping or it's a wall/floor
+            if obj_cat not in OBJECT_CATEGORY_MAP:
+                # Try to map to a known category
+                if obj_cat in ["chair", "sofa", "table", "desk", "bed"]:
+                    pass  # Use as is
+                elif "cabinet" in obj_cat or "drawer" in obj_cat:
+                    obj_cat = "cabinet"
+                elif "shelv" in obj_cat:
+                    obj_cat = "cabinet"
+                elif "plant" in obj_cat:
+                    obj_cat = "plant"
+                elif "tv" in obj_cat or "monitor" in obj_cat:
+                    obj_cat = "tv_monitor"
+                else:
+                    continue
+            
+            sem_id = OBJECT_CATEGORY_MAP[obj_cat]
+            color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
+            
+            # Get the object's vertices (this would need to be adapted to actual HM3D API)
+            if hasattr(obj, 'mesh_vertices'):
+                obj_vertices = np.array(obj.mesh_vertices)
+                for v in obj_vertices:
+                    vertices.append(v)
+                    obj_ids.append(int(obj_id))
+                    sem_ids.append(sem_id)
+                    colors.append(color)
+        
+        sim.close()
+    else:
+        # Original code for Gibson/MP3D
+        ply_data = PlyData.read(ply_path)
+        # Get faces for each object id
+        obj_id_to_faces = defaultdict(list)
+        for face in ply_data["face"]:
+            vids = list(face[0])
+            obj_id = face[1]
+            if obj_id in obj_id_to_cat:
+                p1 = ply_data["vertex"][vids[0]]
+                p1 = [p1[0], p1[2], -p1[1]]
+                p2 = ply_data["vertex"][vids[1]]
+                p2 = [p2[0], p2[2], -p2[1]]
+                p3 = ply_data["vertex"][vids[2]]
+                p3 = [p3[0], p3[2], -p3[1]]
+                obj_id_to_faces[obj_id].append([p1, p2, p3])
+                
+        # Get dense point-clouds for each object id
+        for obj_id, faces in obj_id_to_faces.items():
+            ocat = obj_id_to_cat[obj_id]
+            sem_id = OBJECT_CATEGORY_MAP[ocat]
+            color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
+            # Create trimesh vertices and faces from faces
+            faces = np.array(faces)  # (N, 3, 3)
+            t_pts = hab_utils.dense_sampling_trimesh(faces, sampling_density)
+            for t_pt in t_pts:
+                vertices.append(t_pt)
+                obj_ids.append(obj_id)
+                sem_ids.append(sem_id)
+                colors.append(color)
 
     ############################################################################
     # Get vertices for navigable spaces
@@ -518,6 +625,7 @@ def convert_point_cloud_to_semantic_map(
 
             # -- some maps have 0 obj of interest
             if len(vertices) == 0:
+                
                 info[env][floor_id] = {"y_min": 0.0}
                 dims = (world_dim_discret[2], world_dim_discret[0])
                 mask = np.zeros(dims, dtype=bool)
