@@ -113,7 +113,10 @@ docker cp ~/mp3d "container-id":/app/PONI/data/semantic_maps/mp3d
     ACTIVE_DATASET="gibson" python scripts/create_semantic_maps.py
     ACTIVE_DATASET="mp3d" python scripts/create_semantic_maps.py
     ```
-
+    for hm3d dataset
+    ```
+    python scripts/preprocess_hm3d.py --hm3d_path /app/PONI/data/scene_datasets/hm3d
+    ```
 3. Create dataset for PONI training. </br>(done)
     a. First extract FMM distances for all objects in each map.
     ```
