@@ -16,6 +16,7 @@ import time
 import shutil
 from datetime import datetime
 from tqdm import tqdm
+from PIL import Image
 
 # Check if required packages are installed
 try:
@@ -408,17 +409,15 @@ def extract_scene_point_clouds(scene_path, boundaries_path, pc_save_path, sampli
         return None, False
 
 def generate_basic_semantic_maps(pc_path, boundaries_path, output_path, resolution=0.05, debug=False):
-    """Generate simple semantic maps from point clouds."""
+    """Generate simple semantic maps from point clouds and save as both HDF5 and PNG."""
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # Create a directory for PNG outputs
+        png_output_dir = os.path.join(os.path.dirname(output_path), "png_maps")
+        os.makedirs(png_output_dir, exist_ok=True)
+        
         scene_name = os.path.basename(pc_path).split('.')[0]
-        
-        # Check if output already exists
-        if os.path.exists(output_path):
-            if debug:
-                print(f"Skipping semantic map generation for {scene_name}, output already exists")
-            return output_path, True
-        
+
         # Load point cloud data
         with h5py.File(pc_path, 'r') as f:
             vertices = np.array(f["vertices"])
@@ -513,6 +512,15 @@ def generate_basic_semantic_maps(pc_path, boundaries_path, output_path, resoluti
                 # Wall (dark gray)
                 wall_mask = map_semantic == HM3D_CATEGORY_MAP["wall"]
                 map_semantic_rgb[wall_mask] = [77, 77, 77]
+                
+                # Save as PNG
+                png_filename = f"{scene_name}_floor{floor_id}.png"
+                png_path = os.path.join(png_output_dir, png_filename)
+                img = Image.fromarray(map_semantic_rgb)
+                img.save(png_path)
+                
+                if debug:
+                    print(f"Saved PNG semantic map for floor {floor_id} to {png_path}")
                 
                 # Create floor group in HDF5 file
                 floor_group = f.create_group(floor_id)
