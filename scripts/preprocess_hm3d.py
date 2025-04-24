@@ -9,6 +9,7 @@ import sys
 import argparse
 import json
 import traceback
+import gc
 import numpy as np
 import h5py
 import time
@@ -124,6 +125,49 @@ def make_configuration(scene_path, scene_dataset_config=None, radius=0.18, heigh
     agent_cfg.sensor_specifications = [depth_sensor_cfg]
 
     return habitat_sim.Configuration(backend_cfg, [agent_cfg])
+
+    # Convert numpy float32 to regular floats before JSON serialization
+def convert_to_json_serializable(obj):
+    if isinstance(obj, np.float32):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+# When writing to JSON, add the default parameter
+with open(output_file, 'w') as f:
+    json.dump(boundaries, f, indent=2, default=convert_to_json_serializable)
+
+   def generate_scene_boundaries(scene_path, output_dir, debug=False):
+    # [existing code here...]
+    
+    try:
+        # [existing code...]
+        
+        # Right before the code that saves to JSON, add:
+        # Add this function to recursively convert numpy types to Python native types
+        def convert_numpy_to_python(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {convert_numpy_to_python(k): convert_numpy_to_python(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_to_python(i) for i in obj]
+            return obj
+
+        # Then use it before JSON serialization:
+        boundaries = convert_numpy_to_python(boundaries)
+        
+        # Save to JSON file
+        with open(output_file, 'w') as f:
+            json.dump(boundaries, f, indent=2)
+        
+        # [rest of existing code]
+    
+    except Exception as e:
+        # [exception handling]
 
 def safe_create_simulator(scene_path, debug=False):
     """Create a simulator instance with proper error handling."""
