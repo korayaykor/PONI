@@ -57,16 +57,19 @@ def setup_parser():
     parser = argparse.ArgumentParser(description="Preprocess HM3D dataset for PONI")
     parser.add_argument(
         "--hm3d_path", 
+        type=str,
         required=True, 
         help="Path to HM3D dataset root directory"
     )
     parser.add_argument(
         "--output_path", 
+        type=str,
         default="data/scene_datasets/hm3d",
         help="Path to output processed HM3D files"
     )
     parser.add_argument(
         "--semantic_path", 
+        type=str,
         default="data/semantic_maps/hm3d",
         help="Path to output semantic maps"
     )
@@ -126,48 +129,15 @@ def make_configuration(scene_path, scene_dataset_config=None, radius=0.18, heigh
 
     return habitat_sim.Configuration(backend_cfg, [agent_cfg])
 
-    # Convert numpy float32 to regular floats before JSON serialization
 def convert_to_json_serializable(obj):
-    if isinstance(obj, np.float32):
+    """Convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, np.float32) or isinstance(obj, np.float64):
         return float(obj)
+    elif isinstance(obj, np.int32) or isinstance(obj, np.int64):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-# When writing to JSON, add the default parameter
-with open(output_file, 'w') as f:
-    json.dump(boundaries, f, indent=2, default=convert_to_json_serializable)
-
-   def generate_scene_boundaries(scene_path, output_dir, debug=False):
-    # [existing code here...]
-    
-    try:
-        # [existing code...]
-        
-        # Right before the code that saves to JSON, add:
-        # Add this function to recursively convert numpy types to Python native types
-        def convert_numpy_to_python(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, dict):
-                return {convert_numpy_to_python(k): convert_numpy_to_python(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numpy_to_python(i) for i in obj]
-            return obj
-
-        # Then use it before JSON serialization:
-        boundaries = convert_numpy_to_python(boundaries)
-        
-        # Save to JSON file
-        with open(output_file, 'w') as f:
-            json.dump(boundaries, f, indent=2)
-        
-        # [rest of existing code]
-    
-    except Exception as e:
-        # [exception handling]
 
 def safe_create_simulator(scene_path, debug=False):
     """Create a simulator instance with proper error handling."""
@@ -201,6 +171,7 @@ def safe_close_simulator(sim, debug=False):
         # Explicitly remove references that might hold GL context
         sim.close()
         del sim
+        gc.collect()
     except Exception as e:
         print(f"Error closing simulator: {str(e)}")
         if debug:
@@ -210,9 +181,6 @@ def get_floor_heights(sim, sampling_resolution=0.10):
     """Get heights of different floors in a scene using navmesh points."""
     try:
         # Get all vertices from the navmesh
-        navmesh_vertices = np.array(sim.pathfinder.get_topdown_view().shape)
-        
-        # Get y-coordinate heights and cluster them
         y_coords = np.array([v[1] for v in sim.pathfinder.build_navmesh_vertices()])
         
         # Simple approach: round to nearest 10cm and find clusters
@@ -322,7 +290,7 @@ def generate_scene_boundaries(scene_path, output_dir, debug=False):
         
         # Save to JSON file
         with open(output_file, 'w') as f:
-            json.dump(boundaries, f, indent=2)
+            json.dump(boundaries, f, indent=2, default=convert_to_json_serializable)
         
         # Clean up simulator
         safe_close_simulator(sim, debug)
@@ -362,21 +330,22 @@ def extract_scene_point_clouds(scene_path, boundaries_path, pc_save_path, sampli
         sem_ids = []
         obj_ids = []
         
+        # For HM3D, we'll create a simplified point cloud with floor points from navmesh
+        floor_id = HM3D_CATEGORY_MAP["floor"]
+        wall_id = HM3D_CATEGORY_MAP["wall"]
+        
         # Get navmesh vertices for floor
         navmesh_vertices = np.array(sim.pathfinder.build_navmesh_vertices())
         if debug:
             print(f"Found {len(navmesh_vertices)} navmesh vertices")
         
         # Add floor points
-        floor_id = HM3D_CATEGORY_MAP["floor"]
         for vertex in navmesh_vertices:
             vertices.append(vertex)
             sem_ids.append(floor_id)
             obj_ids.append(-1)  # No specific object
-            
-        # Detect walls by sampling points near vertical surfaces
-        wall_id = HM3D_CATEGORY_MAP["wall"]
-        # Get scene bounds
+        
+        # Sample points for walls
         scene_info = boundaries[scene_name]
         scene_bounds = np.array([
             [scene_info["xlo"], scene_info["ylo"], scene_info["zlo"]],
@@ -420,7 +389,7 @@ def extract_scene_point_clouds(scene_path, boundaries_path, pc_save_path, sampli
             vertices = np.zeros((10, 3))
             sem_ids = np.ones(10) * floor_id
             obj_ids = np.ones(10) * -1
-            
+        
         # Save to HDF5
         with h5py.File(pc_save_path, 'w') as fp:
             fp.create_dataset("vertices", data=vertices)
@@ -588,7 +557,7 @@ def generate_basic_semantic_maps(pc_path, boundaries_path, output_path, resoluti
         
         # Save metadata
         with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(metadata, f, indent=2, default=convert_to_json_serializable)
         
         return output_path, True
     
@@ -670,7 +639,8 @@ def log_progress(successful, failed, num_total, start_time):
         remaining = (num_total - successful - failed) * time_per_scene
         print(f"Time elapsed: {elapsed/60:.1f} minutes")
         print(f"Estimated time remaining: {remaining/60:.1f} minutes")
-        print(f"Estimated completion: {datetime.now().strftime('%H:%M:%S')}")
+        eta = datetime.now().timestamp() + remaining
+        print(f"Estimated completion: {datetime.fromtimestamp(eta).strftime('%H:%M:%S')}")
     
     print("===============================\n")
 
