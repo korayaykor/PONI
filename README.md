@@ -112,6 +112,7 @@ docker cp ~/mp3d "container-id":/app/PONI/data/semantic_maps/mp3d
     cd $PONI_ROOT
     ACTIVE_DATASET="gibson" python scripts/create_semantic_maps.py
     ACTIVE_DATASET="mp3d" python scripts/create_semantic_maps.py
+    ACTIVE_DATASET="hm3d" python scripts/create_semantic_maps.py
     ```
     for hm3d dataset
     ```
