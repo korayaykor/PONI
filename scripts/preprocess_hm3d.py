@@ -12,6 +12,8 @@ import traceback
 import numpy as np
 import h5py
 import time
+import shutil
+from datetime import datetime
 from tqdm import tqdm
 
 # Check if required packages are installed
@@ -36,7 +38,7 @@ except ImportError:
         [188, 189, 34], [219, 219, 141], [23, 190, 207], [158, 218, 229],
     ], dtype=np.uint8)
 
-# Define HM3D category mappings (simplified for now)
+# Define HM3D category mappings 
 HM3D_CATEGORY_MAP = {
     "floor": 1,
     "wall": 2,
@@ -78,6 +80,11 @@ def setup_parser():
         default=0,
         help="Limit processing to N scenes (0=all)"
     )
+    parser.add_argument(
+        "--single_process",
+        action="store_true",
+        help="Process one scene at a time to avoid GPU memory issues"
+    )
     return parser
 
 def find_glb_files(hm3d_path):
@@ -91,40 +98,115 @@ def find_glb_files(hm3d_path):
     print(f"Found {len(glb_files)} .glb files in {hm3d_path}")
     return glb_files
 
-def initialize_simulator_for_scene(scene_path, debug=False):
-    """Initialize the habitat simulator for a given scene with proper configuration."""
+def make_configuration(scene_path, scene_dataset_config=None, radius=0.18, height=0.88):
+    """Create a Habitat-Sim configuration for scene loading with renderer enabled."""
+    
+    # simulator configuration
+    backend_cfg = habitat_sim.SimulatorConfiguration()
+    backend_cfg.scene_id = scene_path
+    backend_cfg.enable_physics = False
+    backend_cfg.create_renderer = True  # CRITICAL: Must be true for navmesh generation
+    
+    if scene_dataset_config is not None:
+        backend_cfg.scene_dataset_config_file = scene_dataset_config
+
+    # agent configuration
+    # Add minimal sensor to satisfy renderer requirements
+    depth_sensor_cfg = habitat_sim.CameraSensorSpec()
+    depth_sensor_cfg.uuid = "depth"
+    depth_sensor_cfg.sensor_type = habitat_sim.SensorType.DEPTH
+    depth_sensor_cfg.resolution = [120, 160]
+    depth_sensor_cfg.position = [0.0, height, 0.0]
+
+    agent_cfg = habitat_sim.agent.AgentConfiguration()
+    agent_cfg.height = height
+    agent_cfg.radius = radius
+    agent_cfg.sensor_specifications = [depth_sensor_cfg]
+
+    return habitat_sim.Configuration(backend_cfg, [agent_cfg])
+
+def safe_create_simulator(scene_path, debug=False):
+    """Create a simulator instance with proper error handling."""
     try:
-        # Create simulator config with rendering and physics explicitly set
-        backend_cfg = habitat_sim.SimulatorConfiguration()
-        backend_cfg.scene_id = scene_path
-        backend_cfg.enable_physics = False
-        backend_cfg.create_renderer = True  # Ensure renderer is created
+        cfg = make_configuration(scene_path)
         
-        # Agent configuration
-        agent_cfg = habitat_sim.agent.AgentConfiguration()
-        agent_cfg.height = 0.88
-        agent_cfg.radius = 0.18
-        agent_cfg.sensor_specifications = []  # No sensors needed
-        
-        # Create simulator
-        cfg = habitat_sim.Configuration(backend_cfg, [agent_cfg])
-        
-        # Initialize simulator
+        # Create the simulator
         sim = habitat_sim.Simulator(cfg)
         
-        # Check if navmesh needs to be computed
+        # Check if we need to compute the navmesh
         if not sim.pathfinder.is_loaded:
-            print(f"Warning: Navmesh is not loaded for {scene_path}. Computing a new navmesh...")
+            if debug:
+                print(f"Computing navmesh for {scene_path}")
             navmesh_settings = habitat_sim.NavMeshSettings()
             navmesh_settings.set_defaults()
             sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
         
         return sim
     except Exception as e:
+        print(f"Error initializing simulator for {scene_path}: {str(e)}")
         if debug:
-            print(f"Error initializing simulator for {scene_path}: {e}")
             traceback.print_exc()
         return None
+
+def safe_close_simulator(sim, debug=False):
+    """Safely close the simulator to avoid GL context errors."""
+    if sim is None:
+        return
+    
+    try:
+        # Explicitly remove references that might hold GL context
+        sim.close()
+        del sim
+    except Exception as e:
+        print(f"Error closing simulator: {str(e)}")
+        if debug:
+            traceback.print_exc()
+
+def get_floor_heights(sim, sampling_resolution=0.10):
+    """Get heights of different floors in a scene using navmesh points."""
+    try:
+        # Get all vertices from the navmesh
+        navmesh_vertices = np.array(sim.pathfinder.get_topdown_view().shape)
+        
+        # Get y-coordinate heights and cluster them
+        y_coords = np.array([v[1] for v in sim.pathfinder.build_navmesh_vertices()])
+        
+        # Simple approach: round to nearest 10cm and find clusters
+        y_rounded = np.round(y_coords * 10) / 10
+        unique_heights, counts = np.unique(y_rounded, return_counts=True)
+        
+        # Only keep heights with significant point counts
+        significant_heights = []
+        min_points = len(y_coords) * 0.05  # At least 5% of all points
+        
+        for height, count in zip(unique_heights, counts):
+            if count > min_points:
+                significant_heights.append(height)
+        
+        significant_heights = sorted(significant_heights)
+        
+        # Create floor data structures
+        floor_extents = []
+        for i, height in enumerate(significant_heights):
+            # Define floor boundaries
+            if i < len(significant_heights) - 1:
+                next_height = significant_heights[i + 1]
+                floor_bounds = (height - 0.5, (height + next_height) / 2 + 0.2)
+            else:
+                floor_bounds = (height - 0.5, height + 2.0)
+            
+            floor_extents.append({
+                "min": float(floor_bounds[0]),
+                "max": float(floor_bounds[1]),
+                "mean": float(height)
+            })
+            
+        return floor_extents
+    
+    except Exception as e:
+        print(f"Error analyzing floor heights: {str(e)}")
+        traceback.print_exc()
+        return [{"min": 0.0, "max": 3.0, "mean": 0.88}]  # Default single floor
 
 def generate_scene_boundaries(scene_path, output_dir, debug=False):
     """Extract scene boundaries and save them to a file."""
@@ -139,21 +221,21 @@ def generate_scene_boundaries(scene_path, output_dir, debug=False):
                 print(f"Skipping {scene_name}, output already exists at {output_file}")
             return output_file, True
         
-        # Initialize simulator with proper configuration for this scene
-        sim = initialize_simulator_for_scene(scene_path, debug)
+        # Create a simulator instance for this scene
+        sim = safe_create_simulator(scene_path, debug)
         if sim is None:
             print(f"Failed to process {scene_name}, simulator initialization failed")
             return None, False
         
-        # Get scene bounds
+        # Get scene bounds from pathfinder
         lower_bound, upper_bound = sim.pathfinder.get_bounds()
         
-        # Convert to the format expected by PONI
-        buffer = np.array([3.0, 0.0, 3.0])  # Buffer in XYZ space
+        # Add buffer to bounds
+        buffer = np.array([3.0, 0.0, 3.0])  # Buffer in XYZ space (meters)
         lower_bound_with_buffer = lower_bound - buffer
         upper_bound_with_buffer = upper_bound + buffer
         
-        # Create boundaries dictionary
+        # Create main scene boundary info
         boundaries = {
             scene_name: {
                 "xlo": float(lower_bound_with_buffer[0]),
@@ -163,163 +245,166 @@ def generate_scene_boundaries(scene_path, output_dir, debug=False):
                 "yhi": float(upper_bound_with_buffer[1]),
                 "zhi": float(upper_bound_with_buffer[2]),
                 "center": [(lower_bound[i] + upper_bound[i]) / 2.0 for i in range(3)],
-                "sizes": [upper_bound[i] - lower_bound[i] for i in range(3)]
+                "sizes": [upper_bound[i] - lower_bound[i] for i in range(3)],
+                "map_world_shift": [lower_bound[0], lower_bound[1], lower_bound[2]],
+                "resolution": 0.05  # 5cm default resolution
             }
         }
         
-        # Check for floors using navmesh vertices
-        try:
-            navmesh_vertices = np.array(sim.pathfinder.build_navmesh_vertices())
-            y_coords = navmesh_vertices[:, 1]
+        # Get floor height information
+        floor_extents = get_floor_heights(sim, sampling_resolution=0.1)
+        
+        # Add floor-specific boundaries
+        for i, floor_data in enumerate(floor_extents):
+            floor_name = f"{scene_name}_{i}"
+            floor_lower = lower_bound.copy()
+            floor_upper = upper_bound.copy()
             
-            # Simple floor detection using height clustering
-            y_coords_rounded = np.round(y_coords * 10) / 10  # Round to nearest 0.1m
-            unique_heights, counts = np.unique(y_coords_rounded, return_counts=True)
+            # Set y bounds for this floor
+            floor_lower[1] = floor_data["min"] 
+            floor_upper[1] = floor_data["max"]
             
-            # Filter out heights with few points (likely noise)
-            significant_heights = []
-            for height, count in zip(unique_heights, counts):
-                if count > len(y_coords) * 0.05:  # At least 5% of all points
-                    significant_heights.append(height)
-            
-            significant_heights = sorted(significant_heights)
-            
-            # Add floor boundaries
-            for i, height in enumerate(significant_heights):
-                floor_name = f"{scene_name}_{i}"
-                floor_lower = lower_bound.copy()
-                floor_upper = upper_bound.copy()
-                
-                # Set y bounds for this floor
-                if i < len(significant_heights) - 1:
-                    next_height = significant_heights[i + 1]
-                    floor_bounds = (height - 0.5, (height + next_height) / 2 + 0.2)
-                else:
-                    floor_bounds = (height - 0.5, height + 2.0)
-                
-                floor_lower[1] = floor_bounds[0]
-                floor_upper[1] = floor_bounds[1]
-                
-                boundaries[floor_name] = {
-                    "xlo": float(floor_lower[0] - buffer[0]),
-                    "ylo": float(floor_lower[1]),
-                    "zlo": float(floor_lower[2] - buffer[2]),
-                    "xhi": float(floor_upper[0] + buffer[0]),
-                    "yhi": float(floor_upper[1]),
-                    "zhi": float(floor_upper[2] + buffer[2]),
-                    "center": [(floor_lower[i] + floor_upper[i]) / 2.0 for i in range(3)],
-                    "sizes": [floor_upper[i] - floor_lower[i] for i in range(3)]
-                }
-        except Exception as e:
-            if debug:
-                print(f"Warning: Could not analyze floors for {scene_name}: {e}")
-                traceback.print_exc()
+            boundaries[floor_name] = {
+                "xlo": float(floor_lower[0] - buffer[0]),
+                "ylo": float(floor_lower[1]),
+                "zlo": float(floor_lower[2] - buffer[2]),
+                "xhi": float(floor_upper[0] + buffer[0]),
+                "yhi": float(floor_upper[1]),
+                "zhi": float(floor_upper[2] + buffer[2]),
+                "center": [(floor_lower[i] + floor_upper[i]) / 2.0 for i in range(3)],
+                "sizes": [floor_upper[i] - floor_lower[i] for i in range(3)],
+                "y_min": floor_data["mean"]
+            }
         
         # Save to JSON file
         with open(output_file, 'w') as f:
             json.dump(boundaries, f, indent=2)
         
-        # Clean up
-        sim.close()
+        # Clean up simulator
+        safe_close_simulator(sim, debug)
         
         return output_file, True
+    
     except Exception as e:
-        print(f"Error processing {scene_path}: {e}")
+        print(f"Error processing {scene_path}: {str(e)}")
         if debug:
             traceback.print_exc()
         return None, False
 
-def extract_point_cloud(scene_path, boundaries_path, output_path, debug=False):
+def extract_scene_point_clouds(scene_path, boundaries_path, pc_save_path, sampling_density=1600.0, debug=False):
     """Extract point cloud data from a scene."""
     try:
-        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(os.path.dirname(pc_save_path), exist_ok=True)
         scene_name = os.path.basename(scene_path).split('.')[0]
-        output_file = os.path.join(output_path, f"{scene_name}.h5")
         
         # Check if output already exists
-        if os.path.exists(output_file):
+        if os.path.exists(pc_save_path):
             if debug:
                 print(f"Skipping point cloud extraction for {scene_name}, output already exists")
-            return output_file, True
+            return pc_save_path, True
         
         # Load boundaries
         with open(boundaries_path, 'r') as f:
             boundaries = json.load(f)
         
-        # Load the scene mesh
-        try:
-            scene = trimesh.load(scene_path)
-        except Exception as e:
-            print(f"Error loading scene mesh: {e}")
+        # Create a simulator instance for this scene
+        sim = safe_create_simulator(scene_path, debug)
+        if sim is None:
+            print(f"Failed to process point cloud for {scene_name}, simulator initialization failed")
             return None, False
         
-        # Sample points from the scene mesh
-        points = []
-        vertices = np.array(scene.vertices)
-        faces = np.array(scene.faces)
+        # Extract vertices from navmesh
+        vertices = []
+        sem_ids = []
+        obj_ids = []
         
-        # Sample points from each face
-        points_per_face = 10  # Number of points to sample per face
-        for face in tqdm(faces, desc=f"Sampling points for {scene_name}", disable=not debug):
-            v1, v2, v3 = vertices[face]
-            # Generate barycentric coordinates
-            u = np.random.rand(points_per_face, 1)
-            v = np.random.rand(points_per_face, 1)
-            mask = u + v > 1
-            u[mask] = 1 - u[mask]
-            v[mask] = 1 - v[mask]
-            w = 1 - u - v
+        # Get navmesh vertices for floor
+        navmesh_vertices = np.array(sim.pathfinder.build_navmesh_vertices())
+        if debug:
+            print(f"Found {len(navmesh_vertices)} navmesh vertices")
+        
+        # Add floor points
+        floor_id = HM3D_CATEGORY_MAP["floor"]
+        for vertex in navmesh_vertices:
+            vertices.append(vertex)
+            sem_ids.append(floor_id)
+            obj_ids.append(-1)  # No specific object
             
-            # Generate points
-            sampled_points = u * v1 + v * v2 + w * v3
-            points.extend(sampled_points)
+        # Detect walls by sampling points near vertical surfaces
+        wall_id = HM3D_CATEGORY_MAP["wall"]
+        # Get scene bounds
+        scene_info = boundaries[scene_name]
+        scene_bounds = np.array([
+            [scene_info["xlo"], scene_info["ylo"], scene_info["zlo"]],
+            [scene_info["xhi"], scene_info["yhi"], scene_info["zhi"]]
+        ])
         
-        points = np.array(points)
+        # Sample random points near walls (simplistic approach)
+        num_wall_samples = 2000
+        for _ in range(num_wall_samples):
+            # Sample point along the perimeter
+            wall_side = np.random.randint(0, 4)
+            if wall_side == 0:  # front
+                x = np.random.uniform(scene_bounds[0][0], scene_bounds[1][0])
+                y = np.random.uniform(scene_bounds[0][1], scene_bounds[1][1])
+                z = scene_bounds[0][2]
+            elif wall_side == 1:  # back
+                x = np.random.uniform(scene_bounds[0][0], scene_bounds[1][0])
+                y = np.random.uniform(scene_bounds[0][1], scene_bounds[1][1])
+                z = scene_bounds[1][2]
+            elif wall_side == 2:  # left
+                x = scene_bounds[0][0]
+                y = np.random.uniform(scene_bounds[0][1], scene_bounds[1][1])
+                z = np.random.uniform(scene_bounds[0][2], scene_bounds[1][2])
+            else:  # right
+                x = scene_bounds[1][0]
+                y = np.random.uniform(scene_bounds[0][1], scene_bounds[1][1])
+                z = np.random.uniform(scene_bounds[0][2], scene_bounds[1][2])
+                
+            vertices.append([x, y, z])
+            sem_ids.append(wall_id)
+            obj_ids.append(-1)
         
-        # Classify points as floor, wall or other
-        sem_ids = np.zeros(len(points), dtype=np.int32)
-        obj_ids = np.zeros(len(points), dtype=np.int32)
+        # Convert to numpy arrays
+        vertices = np.array(vertices)
+        sem_ids = np.array(sem_ids)
+        obj_ids = np.array(obj_ids)
         
-        # Simple classification by height and orientation
-        for i, point in enumerate(points):
-            floor_threshold = 0.3  # meters above the floor
-            scene_info = boundaries[scene_name]
+        if len(vertices) == 0:
+            print(f"Warning: No vertices found for {scene_name}")
+            # Create dummy data
+            vertices = np.zeros((10, 3))
+            sem_ids = np.ones(10) * floor_id
+            obj_ids = np.ones(10) * -1
             
-            # Point is near the floor
-            if abs(point[1] - scene_info["ylo"]) < floor_threshold:
-                sem_ids[i] = HM3D_CATEGORY_MAP["floor"]
-            # Point is near a vertical surface (wall)
-            elif point[1] > scene_info["ylo"] + floor_threshold and point[1] < scene_info["yhi"] - floor_threshold:
-                sem_ids[i] = HM3D_CATEGORY_MAP["wall"]
-            # Otherwise just count it as an "unknown" object
-            else:
-                sem_ids[i] = 0  # Out of bounds
-        
         # Save to HDF5
-        with h5py.File(output_file, 'w') as f:
-            f.create_dataset("vertices", data=points)
-            f.create_dataset("sem_ids", data=sem_ids)
-            f.create_dataset("obj_ids", data=obj_ids)
+        with h5py.File(pc_save_path, 'w') as fp:
+            fp.create_dataset("vertices", data=vertices)
+            fp.create_dataset("obj_ids", data=obj_ids)
+            fp.create_dataset("sem_ids", data=sem_ids)
         
-        return output_file, True
+        # Clean up simulator
+        safe_close_simulator(sim, debug)
+        
+        return pc_save_path, True
+    
     except Exception as e:
-        print(f"Error extracting point cloud from {scene_path}: {e}")
+        print(f"Error extracting point cloud from {scene_path}: {str(e)}")
         if debug:
             traceback.print_exc()
         return None, False
 
-def generate_semantic_maps(pc_path, boundaries_path, output_path, resolution=0.05, debug=False):
-    """Generate semantic maps from point clouds."""
+def generate_basic_semantic_maps(pc_path, boundaries_path, output_path, resolution=0.05, debug=False):
+    """Generate simple semantic maps from point clouds."""
     try:
-        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         scene_name = os.path.basename(pc_path).split('.')[0]
-        output_file = os.path.join(output_path, f"{scene_name}.h5")
         
         # Check if output already exists
-        if os.path.exists(output_file):
+        if os.path.exists(output_path):
             if debug:
                 print(f"Skipping semantic map generation for {scene_name}, output already exists")
-            return output_file, True
+            return output_path, True
         
         # Load point cloud data
         with h5py.File(pc_path, 'r') as f:
@@ -332,150 +417,235 @@ def generate_semantic_maps(pc_path, boundaries_path, output_path, resolution=0.0
             boundaries = json.load(f)
         
         # Process each floor
-        for floor_key, floor_bounds in boundaries.items():
-            if not floor_key.startswith(scene_name + "_"):
-                continue
+        with h5py.File(output_path, 'w') as f:
+            # Store semantic ID constants
+            f.create_dataset(f"wall_sem_id", data=HM3D_CATEGORY_MAP["wall"])
+            f.create_dataset(f"floor_sem_id", data=HM3D_CATEGORY_MAP["floor"])
+            f.create_dataset(f"out-of-bounds_sem_id", data=0)
             
-            # Filter points to this floor
-            floor_mask = (vertices[:, 1] >= floor_bounds["ylo"]) & (vertices[:, 1] <= floor_bounds["yhi"])
-            floor_vertices = vertices[floor_mask]
-            floor_sem_ids = sem_ids[floor_mask]
-            floor_obj_ids = obj_ids[floor_mask]
-            
-            if len(floor_vertices) == 0:
-                print(f"No points found for floor {floor_key}")
-                continue
-            
-            # Project to 2D grid
-            world_dim = np.array([floor_bounds["sizes"][0], 0, floor_bounds["sizes"][2]])
-            world_dim += 2  # Add padding
-            
-            central_pos = np.array(floor_bounds["center"])
-            central_pos[1] = 0  # Set y to 0
-            
-            map_world_shift = central_pos - world_dim / 2
-            
-            world_dim_discret = [
-                int(np.round(world_dim[0] / resolution)),
-                0,
-                int(np.round(world_dim[2] / resolution))
-            ]
-            
-            # Convert vertices to map coordinates
-            map_vertices = floor_vertices.copy()
-            map_vertices -= map_world_shift
-            
-            # Discretize to grid
-            grid_x = np.round(map_vertices[:, 0] / resolution).astype(np.int32)
-            grid_z = np.round(map_vertices[:, 2] / resolution).astype(np.int32)
-            
-            # Filter out points outside the grid
-            valid_mask = (grid_x >= 0) & (grid_x < world_dim_discret[0]) & \
-                         (grid_z >= 0) & (grid_z < world_dim_discret[2])
-            
-            grid_x = grid_x[valid_mask]
-            grid_z = grid_z[valid_mask]
-            floor_sem_ids = floor_sem_ids[valid_mask]
-            floor_obj_ids = floor_obj_ids[valid_mask]
-            heights = map_vertices[valid_mask, 1]
-            
-            # Create semantic map
-            sem_map = np.zeros((world_dim_discret[2], world_dim_discret[0]), dtype=np.int32)
-            obj_map = np.zeros((world_dim_discret[2], world_dim_discret[0]), dtype=np.int32)
-            height_map = np.zeros((world_dim_discret[2], world_dim_discret[0]), dtype=np.float32)
-            
-            # Fill maps using a voxel grid approach
-            grid_indices = np.vstack([grid_z, grid_x]).T  # [N, 2]
-            
-            # For each point, find corresponding grid cell
-            for i in range(len(grid_indices)):
-                z, x = grid_indices[i]
-                if z < world_dim_discret[2] and x < world_dim_discret[0]:
-                    # Only update if point is higher than current height or cell is empty
-                    if height_map[z, x] < heights[i] or height_map[z, x] == 0:
-                        height_map[z, x] = heights[i]
-                        sem_map[z, x] = floor_sem_ids[i]
-                        obj_map[z, x] = floor_obj_ids[i]
-            
-            # Get floor ID
-            floor_id = floor_key.split('_')[-1]
-            
-            # Create or update HDF5 file
-            with h5py.File(output_file, 'a') as f:
-                # Create floor group if it doesn't exist
-                if floor_id not in f:
-                    f.create_group(floor_id)
+            for floor_key, floor_bounds in boundaries.items():
+                if not floor_key.startswith(scene_name + "_"):
+                    continue
                 
-                # Create datasets
-                mask = (sem_map > 0).astype(bool)
-                f.create_dataset(f"{floor_id}/mask", data=mask)
-                f.create_dataset(f"{floor_id}/map_heights", data=height_map)
-                f.create_dataset(f"{floor_id}/map_instance", data=obj_map)
-                f.create_dataset(f"{floor_id}/map_semantic", data=sem_map)
+                # Extract floor number
+                floor_id = floor_key.split('_')[-1]
+                
+                # Filter points to this floor
+                floor_min = floor_bounds.get("ylo", floor_bounds.get("y_min", 0) - 0.5)
+                floor_max = floor_bounds.get("yhi", floor_bounds.get("y_min", 0) + 2.5)
+                
+                floor_mask = (vertices[:, 1] >= floor_min) & (vertices[:, 1] <= floor_max)
+                floor_vertices = vertices[floor_mask]
+                floor_sem_ids = sem_ids[floor_mask]
+                floor_obj_ids = obj_ids[floor_mask]
+                
+                if len(floor_vertices) == 0:
+                    print(f"No points found for floor {floor_key}")
+                    # Create empty floor maps
+                    map_size = 240  # 24 meters at 10cm resolution
+                    mask = np.zeros((map_size, map_size), dtype=bool)
+                    map_heights = np.zeros((map_size, map_size), dtype=np.float32)
+                    map_instance = np.zeros((map_size, map_size), dtype=np.int32)
+                    map_semantic = np.zeros((map_size, map_size), dtype=np.int32)
+                    map_semantic_rgb = np.zeros((map_size, map_size, 3), dtype=np.uint8)
+                    
+                    # Create empty floor group
+                    floor_group = f.create_group(floor_id)
+                    floor_group.create_dataset("mask", data=mask)
+                    floor_group.create_dataset("map_heights", data=map_heights)
+                    floor_group.create_dataset("map_instance", data=map_instance)
+                    floor_group.create_dataset("map_semantic", data=map_semantic)
+                    floor_group.create_dataset("map_semantic_rgb", data=map_semantic_rgb)
+                    continue
+                
+                # Get scene coordinates
+                world_center = np.array(floor_bounds["center"])
+                world_size = np.array(floor_bounds["sizes"])
+                
+                # Create 2D top-down map
+                # Map dimensions based on bounds
+                map_size_x = int(world_size[0] / resolution) + 20  # Add padding
+                map_size_z = int(world_size[2] / resolution) + 20
+                
+                # Initialize maps
+                mask = np.zeros((map_size_z, map_size_x), dtype=bool)
+                map_heights = np.zeros((map_size_z, map_size_x), dtype=np.float32)
+                map_instance = np.zeros((map_size_z, map_size_x), dtype=np.int32)
+                map_semantic = np.zeros((map_size_z, map_size_x), dtype=np.int32)
+                
+                # Project points to 2D grid
+                for i, (vertex, sem_id, obj_id) in enumerate(zip(floor_vertices, floor_sem_ids, floor_obj_ids)):
+                    # Get grid coordinates (top-down view)
+                    grid_x = int((vertex[0] - (world_center[0] - world_size[0]/2)) / resolution)
+                    grid_z = int((vertex[2] - (world_center[2] - world_size[2]/2)) / resolution)
+                    
+                    # Skip if outside grid
+                    if grid_x < 0 or grid_x >= map_size_x or grid_z < 0 or grid_z >= map_size_z:
+                        continue
+                    
+                    # Update maps
+                    mask[grid_z, grid_x] = True
+                    map_heights[grid_z, grid_x] = vertex[1]
+                    map_instance[grid_z, grid_x] = obj_id
+                    map_semantic[grid_z, grid_x] = sem_id
                 
                 # Create RGB visualization
-                sem_rgb = np.zeros((world_dim_discret[2], world_dim_discret[0], 3), dtype=np.uint8)
+                map_semantic_rgb = np.zeros((map_size_z, map_size_x, 3), dtype=np.uint8)
                 
-                # Floor is light gray
-                sem_rgb[sem_map == HM3D_CATEGORY_MAP["floor"]] = [230, 230, 230]
-                # Wall is dark gray
-                sem_rgb[sem_map == HM3D_CATEGORY_MAP["wall"]] = [77, 77, 77]
-                # Other objects get colors based on their semantic ID
-                for id in range(3, 20):  # Assuming up to 20 semantic categories
-                    if np.any(sem_map == id):
-                        # Use a color from a predefined palette
-                        color_idx = (id - 3) % len(d3_40_colors_rgb)
-                        sem_rgb[sem_map == id] = d3_40_colors_rgb[color_idx]
+                # Color the map
+                # Floor (light gray)
+                floor_mask = map_semantic == HM3D_CATEGORY_MAP["floor"]
+                map_semantic_rgb[floor_mask] = [230, 230, 230]
                 
-                f.create_dataset(f"{floor_id}/map_semantic_rgb", data=sem_rgb)
+                # Wall (dark gray)
+                wall_mask = map_semantic == HM3D_CATEGORY_MAP["wall"]
+                map_semantic_rgb[wall_mask] = [77, 77, 77]
+                
+                # Create floor group in HDF5 file
+                floor_group = f.create_group(floor_id)
+                floor_group.create_dataset("mask", data=mask)
+                floor_group.create_dataset("map_heights", data=map_heights)
+                floor_group.create_dataset("map_instance", data=map_instance)
+                floor_group.create_dataset("map_semantic", data=map_semantic)
+                floor_group.create_dataset("map_semantic_rgb", data=map_semantic_rgb)
         
-        # Save metadata
-        metadata_file = os.path.join(output_path, "semmap_GT_info.json")
+        # Create metadata for semantic maps
+        metadata_file = os.path.join(os.path.dirname(output_path), "semmap_GT_info.json")
+        
+        # Load existing metadata if available
         if os.path.exists(metadata_file):
             with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
         else:
             metadata = {}
         
+        # Update metadata with scene information
+        scene_info = boundaries[scene_name]
+        metadata[scene_name] = {
+            "dim": [
+                int(scene_info["sizes"][0] / resolution),
+                0,
+                int(scene_info["sizes"][2] / resolution)
+            ],
+            "central_pos": scene_info["center"],
+            "map_world_shift": scene_info.get("map_world_shift", [0, 0, 0]),
+            "resolution": resolution
+        }
+        
+        # Add floor-specific metadata
         for floor_key, floor_bounds in boundaries.items():
-            if not floor_key.startswith(scene_name):
+            if not floor_key.startswith(scene_name + "_"):
                 continue
             
-            world_dim = np.array([floor_bounds["sizes"][0], 0, floor_bounds["sizes"][2]])
-            world_dim += 2  # Add padding
-            
-            central_pos = np.array(floor_bounds["center"])
-            map_world_shift = central_pos - world_dim / 2
-            
-            world_dim_discret = [
-                int(np.round(world_dim[0] / resolution)),
-                0,
-                int(np.round(world_dim[2] / resolution))
-            ]
-            
-            if scene_name not in metadata:
-                metadata[scene_name] = {
-                    "dim": world_dim_discret,
-                    "central_pos": central_pos.tolist(),
-                    "map_world_shift": map_world_shift.tolist(),
-                    "resolution": resolution
-                }
-            
-            if floor_key.startswith(scene_name + "_"):
-                floor_id = floor_key.split('_')[-1]
-                metadata[scene_name][floor_id] = {
-                    "y_min": float(floor_bounds["ylo"])
-                }
+            floor_id = floor_key.split("_")[-1]
+            metadata[scene_name][floor_id] = {
+                "y_min": float(floor_bounds.get("y_min", floor_bounds.get("ylo", 0)))
+            }
         
+        # Save metadata
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
         
-        return output_file, True
+        return output_path, True
+    
     except Exception as e:
-        print(f"Error generating semantic maps for {pc_path}: {e}")
+        print(f"Error generating semantic maps for {pc_path}: {str(e)}")
         if debug:
             traceback.print_exc()
         return None, False
+
+def process_single_scene(scene_path, args):
+    """Process a single scene with proper cleanup between scenes."""
+    try:
+        scene_name = os.path.basename(scene_path).split('.')[0]
+        boundaries_dir = os.path.join(args.semantic_path, "scene_boundaries")
+        pc_dir = os.path.join(args.semantic_path, "point_clouds")
+        sem_map_dir = os.path.join(args.semantic_path, "semantic_maps")
+        
+        # Create output directories
+        os.makedirs(boundaries_dir, exist_ok=True)
+        os.makedirs(pc_dir, exist_ok=True)
+        os.makedirs(sem_map_dir, exist_ok=True)
+        
+        # Output file paths
+        boundaries_path = os.path.join(boundaries_dir, f"{scene_name}.json")
+        pc_path = os.path.join(pc_dir, f"{scene_name}.h5")
+        sem_map_path = os.path.join(sem_map_dir, f"{scene_name}.h5")
+        
+        # Step 1: Generate scene boundaries
+        print(f"Processing scene boundaries for {scene_name}")
+        boundaries_file, success = generate_scene_boundaries(
+            scene_path, boundaries_dir, args.debug
+        )
+        
+        if not success:
+            print(f"Failed to process scene boundaries for {scene_name}")
+            return False
+        
+        # Step 2: Extract point cloud
+        print(f"Extracting point cloud for {scene_name}")
+        pc_file, success = extract_scene_point_clouds(
+            scene_path, boundaries_path, pc_path, debug=args.debug
+        )
+        
+        if not success:
+            print(f"Failed to extract point cloud for {scene_name}")
+            return False
+        
+        # Step 3: Generate semantic maps
+        print(f"Generating semantic maps for {scene_name}")
+        sem_map_file, success = generate_basic_semantic_maps(
+            pc_path, boundaries_path, sem_map_path, debug=args.debug
+        )
+        
+        if not success:
+            print(f"Failed to generate semantic maps for {scene_name}")
+            return False
+        
+        print(f"Successfully processed {scene_name}")
+        return True
+    
+    except Exception as e:
+        print(f"Error processing scene {scene_path}: {str(e)}")
+        if args.debug:
+            traceback.print_exc()
+        return False
+
+def log_progress(successful, failed, num_total, start_time):
+    """Log processing progress."""
+    elapsed = time.time() - start_time
+    success_rate = successful / max(1, (successful + failed))
+    
+    print(f"\n===== Processing Progress =====")
+    print(f"Successful: {successful}/{num_total} ({successful/num_total*100:.1f}%)")
+    print(f"Failed: {failed}/{num_total} ({failed/num_total*100:.1f}%)")
+    print(f"Success rate: {success_rate*100:.1f}%")
+    
+    if successful > 0:
+        time_per_scene = elapsed / successful
+        remaining = (num_total - successful - failed) * time_per_scene
+        print(f"Time elapsed: {elapsed/60:.1f} minutes")
+        print(f"Estimated time remaining: {remaining/60:.1f} minutes")
+        print(f"Estimated completion: {datetime.now().strftime('%H:%M:%S')}")
+    
+    print("===============================\n")
+
+def create_hm3d_split_metadata(scenes, output_dir):
+    """Create dataset split metadata for HM3D scenes."""
+    # Create train/val split (80/20)
+    np.random.shuffle(scenes)
+    split_idx = int(len(scenes) * 0.8)
+    
+    splits = {
+        "train": scenes[:split_idx],
+        "val": scenes[split_idx:]
+    }
+    
+    # Save splits to JSON
+    with open(os.path.join(output_dir, "hm3d_splits.json"), 'w') as f:
+        json.dump(splits, f, indent=2)
+    
+    print(f"Created dataset splits: {len(splits['train'])} train scenes, {len(splits['val'])} val scenes")
 
 def main():
     parser = setup_parser()
@@ -494,141 +664,196 @@ def main():
     if args.limit > 0:
         glb_files = glb_files[:args.limit]
     
-    # Process each scene
-    results = {
-        "boundaries": {"success": 0, "failed": 0},
-        "point_clouds": {"success": 0, "failed": 0},
-        "semantic_maps": {"success": 0, "failed": 0}
-    }
+    # Process scenes
+    successful = 0
+    failed = 0
+    start_time = time.time()
     
-    scene_file_name_map = {}  # To keep track of processed file paths
+    # Create a backup of PYTHONPATH before modifying
+    original_pythonpath = os.environ.get('PYTHONPATH', '')
     
-    # Stage 1: Generate scene boundaries
-    print("\nGenerating scene boundaries:")
-    for scene_file in tqdm(glb_files, desc="Processing scene boundaries"):
-        scene_name = os.path.basename(scene_file).split('.')[0]
-        boundaries_path = os.path.join(args.semantic_path, "scene_boundaries", f"{scene_name}.json")
-        
-        # Skip if already processed
-        if os.path.exists(boundaries_path) and not args.debug:
-            results["boundaries"]["success"] += 1
-            scene_file_name_map[scene_name] = {"scene_file": scene_file, "boundaries_path": boundaries_path}
-            continue
-        
-        try:
-            boundaries_file, success = generate_scene_boundaries(
-                scene_file, 
-                os.path.join(args.semantic_path, "scene_boundaries"),
-                args.debug
-            )
+    if args.single_process:
+        print("\nProcessing one scene at a time to avoid memory issues...")
+        for i, scene_file in enumerate(glb_files):
+            print(f"\nProcessing scene {i+1}/{len(glb_files)}: {os.path.basename(scene_file)}")
+            
+            # Reset PYTHONPATH for each scene to avoid memory leaks
+            if 'PYTHONPATH' in os.environ:
+                os.environ['PYTHONPATH'] = original_pythonpath
+            
+            success = process_single_scene(scene_file, args)
             
             if success:
-                results["boundaries"]["success"] += 1
-                scene_file_name_map[scene_name] = {"scene_file": scene_file, "boundaries_path": boundaries_file}
+                successful += 1
             else:
-                results["boundaries"]["failed"] += 1
-        except Exception as e:
-            print(f"Error processing scene boundaries for {scene_name}: {e}")
-            if args.debug:
-                traceback.print_exc()
-            results["boundaries"]["failed"] += 1
-    
-    # Stage 2: Extract point clouds
-    print("\nExtracting point clouds:")
-    for scene_name, scene_info in tqdm(scene_file_name_map.items(), desc="Extracting point clouds"):
-        if "boundaries_path" not in scene_info:
-            results["point_clouds"]["failed"] += 1
-            continue
+                failed += 1
             
-        pc_path = os.path.join(args.semantic_path, "point_clouds", f"{scene_name}.h5")
+            # Log progress every 5 scenes
+            if (i+1) % 5 == 0 or i == len(glb_files) - 1:
+                log_progress(successful, failed, len(glb_files), start_time)
+            
+            # Force clean up any remaining GL contexts
+            # This is crucial to avoid the GL::Context crashes
+            if 'habitat_sim' in sys.modules:
+                del sys.modules['habitat_sim']
+            gc.collect()
+    else:
+        # Process all scenes in parallel (less safe for GPU memory)
+        # This approach is faster but more likely to encounter GL context errors
+        print("\nProcessing all scenes (parallel approach)...")
         
-        # Skip if already processed
-        if os.path.exists(pc_path) and not args.debug:
-            results["point_clouds"]["success"] += 1
-            scene_file_name_map[scene_name]["pc_path"] = pc_path
-            continue
-            
-        try:
-            pc_file, success = extract_point_cloud(
-                scene_info["scene_file"],
-                scene_info["boundaries_path"],
-                os.path.join(args.semantic_path, "point_clouds"),
-                args.debug
-            )
-            
-            if success:
-                results["point_clouds"]["success"] += 1
-                scene_file_name_map[scene_name]["pc_path"] = pc_file
-            else:
-                results["point_clouds"]["failed"] += 1
-        except Exception as e:
-            print(f"Error extracting point cloud for {scene_name}: {e}")
-            if args.debug:
-                traceback.print_exc()
-            results["point_clouds"]["failed"] += 1
-    
-    # Stage 3: Generate semantic maps
-    print("\nGenerating semantic maps:")
-    for scene_name, scene_info in tqdm(scene_file_name_map.items(), desc="Generating semantic maps"):
-        if "pc_path" not in scene_info or "boundaries_path" not in scene_info:
-            results["semantic_maps"]["failed"] += 1
-            continue
-            
-        sem_map_path = os.path.join(args.semantic_path, "semantic_maps", f"{scene_name}.h5")
+        # Step 1: Generate scene boundaries
+        print("\nGenerating scene boundaries:")
+        scene_boundaries = {}
         
-        # Skip if already processed
-        if os.path.exists(sem_map_path) and not args.debug:
-            results["semantic_maps"]["success"] += 1
-            continue
+        for i, scene_file in enumerate(tqdm(glb_files, desc="Processing scene boundaries")):
+            scene_name = os.path.basename(scene_file).split('.')[0]
+            boundaries_path = os.path.join(args.semantic_path, "scene_boundaries", f"{scene_name}.json")
             
-        try:
-            sem_map_file, success = generate_semantic_maps(
-                scene_info["pc_path"],
-                scene_info["boundaries_path"],
-                os.path.join(args.semantic_path, "semantic_maps"),
-                resolution=0.05,
-                debug=args.debug
-            )
+            # Skip if already processed
+            if os.path.exists(boundaries_path) and not args.debug:
+                successful += 1
+                scene_boundaries[scene_name] = {
+                    "scene_file": scene_file, 
+                    "boundaries_path": boundaries_path
+                }
+                continue
             
-            if success:
-                results["semantic_maps"]["success"] += 1
-            else:
-                results["semantic_maps"]["failed"] += 1
-        except Exception as e:
-            print(f"Error generating semantic map for {scene_name}: {e}")
-            if args.debug:
-                traceback.print_exc()
-            results["semantic_maps"]["failed"] += 1
+            try:
+                boundaries_file, success = generate_scene_boundaries(
+                    scene_file, 
+                    os.path.join(args.semantic_path, "scene_boundaries"),
+                    args.debug
+                )
+                
+                if success:
+                    successful += 1
+                    scene_boundaries[scene_name] = {
+                        "scene_file": scene_file, 
+                        "boundaries_path": boundaries_file
+                    }
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"Error processing scene boundaries for {scene_name}: {e}")
+                if args.debug:
+                    traceback.print_exc()
+                failed += 1
+            
+            # Force cleanup
+            gc.collect()
+            
+        # Step 2: Extract point clouds
+        print("\nExtracting point clouds:")
+        successful = 0
+        failed = 0
+        
+        for scene_name, scene_info in tqdm(scene_boundaries.items(), desc="Extracting point clouds"):
+            if "boundaries_path" not in scene_info:
+                failed += 1
+                continue
+                
+            pc_path = os.path.join(args.semantic_path, "point_clouds", f"{scene_name}.h5")
+            
+            # Skip if already processed
+            if os.path.exists(pc_path) and not args.debug:
+                successful += 1
+                scene_boundaries[scene_name]["pc_path"] = pc_path
+                continue
+                
+            try:
+                pc_file, success = extract_scene_point_clouds(
+                    scene_info["scene_file"],
+                    scene_info["boundaries_path"],
+                    os.path.join(args.semantic_path, "point_clouds", f"{scene_name}.h5"),
+                    debug=args.debug
+                )
+                
+                if success:
+                    successful += 1
+                    scene_boundaries[scene_name]["pc_path"] = pc_file
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"Error extracting point cloud for {scene_name}: {e}")
+                if args.debug:
+                    traceback.print_exc()
+                failed += 1
+            
+            # Force cleanup
+            gc.collect()
+        
+        # Step 3: Generate semantic maps
+        print("\nGenerating semantic maps:")
+        successful = 0
+        failed = 0
+        
+        for scene_name, scene_info in tqdm(scene_boundaries.items(), desc="Generating semantic maps"):
+            if "pc_path" not in scene_info or "boundaries_path" not in scene_info:
+                failed += 1
+                continue
+                
+            sem_map_path = os.path.join(args.semantic_path, "semantic_maps", f"{scene_name}.h5")
+            
+            # Skip if already processed
+            if os.path.exists(sem_map_path) and not args.debug:
+                successful += 1
+                continue
+                
+            try:
+                sem_map_file, success = generate_basic_semantic_maps(
+                    scene_info["pc_path"],
+                    scene_info["boundaries_path"],
+                    os.path.join(args.semantic_path, "semantic_maps", f"{scene_name}.h5"),
+                    resolution=0.05,
+                    debug=args.debug
+                )
+                
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"Error generating semantic map for {scene_name}: {e}")
+                if args.debug:
+                    traceback.print_exc()
+                failed += 1
     
-    # Print summary
-    print("\nPreprocessing complete!")
-    print(f"Scene boundaries: {results['boundaries']['success']} succeeded, {results['boundaries']['failed']} failed")
-    print(f"Point clouds: {results['point_clouds']['success']} succeeded, {results['point_clouds']['failed']} failed")
-    print(f"Semantic maps: {results['semantic_maps']['success']} succeeded, {results['semantic_maps']['failed']} failed")
-    
-    # Save metadata for HM3D scenes
+    # Create dataset split information
     print("\nCreating HM3D split metadata...")
+    processed_scenes = [os.path.basename(f).split('.')[0] for f in glb_files 
+                      if os.path.exists(os.path.join(args.semantic_path, "semantic_maps", f"{os.path.basename(f).split('.')[0]}.h5"))]
     
-    # Create dataset split information based on successfully processed scenes
-    hm3d_splits = {
-        "train": [],
-        "val": []
-    }
+    if processed_scenes:
+        create_hm3d_split_metadata(processed_scenes, args.semantic_path)
     
-    # Assign scenes to splits (80% train, 20% val)
-    processed_scenes = list(scene_file_name_map.keys())
-    np.random.shuffle(processed_scenes)
+    print("\nPreprocessing complete!")
+    total_time = (time.time() - start_time) / 60.0
+    print(f"Total processing time: {total_time:.1f} minutes")
     
-    train_count = int(0.8 * len(processed_scenes))
-    hm3d_splits["train"] = processed_scenes[:train_count]
-    hm3d_splits["val"] = processed_scenes[train_count:]
-    
-    # Save split information
-    with open(os.path.join(args.semantic_path, "hm3d_splits.json"), 'w') as f:
-        json.dump(hm3d_splits, f, indent=2)
-    
-    print(f"Created dataset splits: {len(hm3d_splits['train'])} train scenes, {len(hm3d_splits['val'])} val scenes")
-    print(f"Output directories:\n- {args.output_path}\n- {args.semantic_path}")
+    # Finalize: Create an updated constants.py file to include HM3D dataset
+    try:
+        print("\nUpdating PONI constants to include HM3D dataset...")
+        # Check if constants_hm3d.py exists
+        constants_hm3d_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "poni", "constants_hm3d.py")
+        
+        if os.path.exists(constants_hm3d_path):
+            # Run the update_constants.py script
+            update_script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "update_constants.py")
+            
+            if os.path.exists(update_script_path):
+                print(f"Running constants update script: {update_script_path}")
+                import subprocess
+                subprocess.run([sys.executable, update_script_path], check=True)
+                print("Constants updated successfully!")
+            else:
+                print(f"Constants update script not found at {update_script_path}")
+        else:
+            print(f"HM3D constants file not found at {constants_hm3d_path}")
+    except Exception as e:
+        print(f"Error updating constants: {e}")
+        if args.debug:
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()
