@@ -37,10 +37,26 @@ from poni.constants import (
 from poni.fmm_planner import FMMPlanner
 from einops import asnumpy, repeat
 from matplotlib import font_manager
-from poni.utils.utils import is_int
 
 MIN_OBJECTS_THRESH = 4
 EPS = 1e-10
+
+
+def is_int(s):
+    """
+    Check if a string can be converted to an integer.
+    
+    Args:
+        s: The string to check
+        
+    Returns:
+        bool: True if the string can be converted to an integer, False otherwise
+    """
+    try:
+        int(s)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def load_data(save_path):
