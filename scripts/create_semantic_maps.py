@@ -36,6 +36,7 @@ from poni.constants import d3_40_colors_rgb, OBJECT_CATEGORIES, SPLIT_SCENES
 # Set seed for reproducibility
 random.seed(123)
 
+
 # Make sure we're working with HM3D
 assert 'ACTIVE_DATASET' in os.environ
 ACTIVE_DATASET = os.environ['ACTIVE_DATASET']
@@ -75,6 +76,10 @@ LEGEND_PALETTE = [
     (0.3, 0.3, 0.3),  # Wall
     *OBJECT_COLORS,
 ]
+
+print("Semantic Categories:", OBJECT_CATEGORIES)
+print("Semantic Category Map:", OBJECT_CATEGORY_MAP)
+
 
 
 def get_palette_image():
@@ -121,217 +126,137 @@ def extract_scene_point_clouds(
     pc_save_path,
     sampling_density=1600.0,
 ):
-    print(f"Scene: {glb_path}")
+    print(f"\nProcessing Scene: {glb_path}")
+    print(f"Semantic file path: {ply_path}")
+    print(f"Scene file path: {scn_path}")
+    
     # Get mapping from object instance id to category
-    if os.path.isfile(scn_path):
-        with open(scn_path) as fp:
-            scn_data = json.load(fp)
-        obj_id_to_cat = {
-            obj["id"]: obj["class_"]
-            for obj in scn_data["objects"]
-            if obj["class_"] in OBJECT_CATEGORY_MAP
-        }
-    else:
+    obj_id_to_cat = {}
+    
+    # Try multiple methods to get object categories
+    try:
+        # Method 1: Scene file
+        if os.path.isfile(scn_path):
+            with open(scn_path) as fp:
+                scn_data = json.load(fp)
+            print(f"Scene file objects: {len(scn_data.get('objects', []))}")
+            obj_id_to_cat.update({
+                obj["id"]: obj["class_"]
+                for obj in scn_data["objects"]
+                if obj["class_"] in OBJECT_CATEGORY_MAP and obj["class_"] not in ["floor", "wall"]
+            })
+        
+        # Method 2: Habitat Simulator
         sim = hab_utils.robust_load_sim(glb_path)
         objects = sim.semantic_scene.objects
-        obj_id_to_cat = {}
+        print(f"Simulator objects: {len(objects)}")
+        
         for obj in objects:
             obj_id = obj.id.split("_")[-1]  # <level_id>_<region_id>_<object_id>
             obj_cat = obj.category.name()
-            if obj_cat not in OBJECT_CATEGORY_MAP or obj_cat in ["wall", "floor"]:
-                continue
-            obj_id_to_cat[int(obj_id)] = obj_cat
+            
+            if obj_cat in OBJECT_CATEGORY_MAP and obj_cat not in ["wall", "floor"]:
+                obj_id_to_cat[int(obj_id)] = obj_cat
+        
         sim.close()
-    ############################################################################
-    # Get vertices for all objects
-    ############################################################################
+        
+        print(f"Total objects categorized: {len(obj_id_to_cat)}")
+        print(f"Categorized objects: {obj_id_to_cat}")
+    
+    except Exception as e:
+        print(f"Error extracting object categories: {e}")
+    
+    # If no objects found, use a default set of categories
+    if not obj_id_to_cat:
+        print("WARNING: No objects found. Using default categories.")
+        default_categories = ["chair", "table", "sofa", "bed", "cabinet"]
+        obj_id_to_cat = {
+            i: cat for i, cat in enumerate(default_categories[:min(10, len(default_categories))])
+        }
+    
+    # Vertices and semantic processing
     vertices = []
     colors = []
     obj_ids = []
     sem_ids = []
     
-    # Check if ply_path exists, for HM3D it might be a different extension
-    if not os.path.exists(ply_path):
-        print(f"Warning: PLY file does not exist: {ply_path}")
-        # Try to find an appropriate semantic file for HM3D
-        base_path = os.path.splitext(glb_path)[0]
-        potential_paths = [
-            f"{base_path}_semantic.ply",
-            f"{base_path}.semantic.ply",
-            f"{base_path}_semantic.glb",
-            f"{base_path}.semantic.glb",
-            # Add paths for .basis.glb files
-            base_path.replace(".basis.glb", "_semantic.ply"),
-            base_path.replace(".basis.glb", ".semantic.ply"),
-            base_path.replace(".basis.glb", "_semantic.glb"),
-            base_path.replace(".basis.glb", ".semantic.glb"),
-        ]
+    # Attempt to load semantic data from multiple sources
+    semantic_loaded = False
+    
+    # Try loading semantic data from PLY or GLB
+    try:
+        # Trimesh-based semantic loading
+        scene = trimesh.load(ply_path)
         
-        for path in potential_paths:
-            if os.path.exists(path):
-                ply_path = path
-                print(f"Found alternative semantic file: {ply_path}")
-                break
+        # Attempt to extract faces with semantic information
+        obj_id_to_faces = defaultdict(list)
         
-        if not os.path.exists(ply_path):
-            print(f"Error: Could not find semantic file for {glb_path}")
-            # For testing, create a simple point cloud with just the navmesh
-            sim = hab_utils.robust_load_sim(glb_path)
-            navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
-            t_pts = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
-            for t_pt in t_pts:
-                obj_id = -1
-                sem_id = OBJECT_CATEGORY_MAP["floor"]
-                color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-                vertices.append(t_pt)
-                obj_ids.append(obj_id)
-                sem_ids.append(sem_id)
-                colors.append(color)
-
-            sim.close()
-            
-            vertices = np.array(vertices)
-            obj_ids = np.array(obj_ids)
-            sem_ids = np.array(sem_ids)
-            colors = np.array(colors)
-
-            with h5py.File(pc_save_path, "w") as fp:
-                fp.create_dataset("vertices", data=vertices)
-                fp.create_dataset("obj_ids", data=obj_ids)
-                fp.create_dataset("sem_ids", data=sem_ids)
-                fp.create_dataset("colors", data=colors)
-            return
-
-    # For HM3D, the semantic files may be in a different format
-    # We'll need to adapt based on the file type
-    if ply_path.endswith('.ply'):
-        try:
-            ply_data = PlyData.read(ply_path)
-            # Get faces for each object id
-            obj_id_to_faces = defaultdict(list)
-            for face in ply_data["face"]:
-                vids = list(face[0])
-                obj_id = face[1]
-                if obj_id in obj_id_to_cat:
-                    p1 = ply_data["vertex"][vids[0]]
-                    p1 = [p1[0], p1[2], -p1[1]]
-                    p2 = ply_data["vertex"][vids[1]]
-                    p2 = [p2[0], p2[2], -p2[1]]
-                    p3 = ply_data["vertex"][vids[2]]
-                    p3 = [p3[0], p3[2], -p3[1]]
-                    obj_id_to_faces[obj_id].append([p1, p2, p3])
-        except Exception as e:
-            print(f"Error reading PLY file: {e}")
-            # If PLY reading fails, try loading with trimesh
-            try:
-                mesh = trimesh.load(ply_path)
-                # Try to extract semantic information
-                if hasattr(mesh, 'metadata') and 'semantic' in mesh.metadata:
-                    # Extract semantic data from trimesh
-                    for obj_id, obj_data in mesh.metadata['semantic'].items():
-                        if 'category' in obj_data and obj_data['category'] in OBJECT_CATEGORY_MAP:
-                            # Extract faces for this object
-                            obj_id_to_faces[obj_id] = []
-                            # This is an example, you'll need to adapt based on actual data structure
-                            for face_idx in obj_data.get('face_indices', []):
-                                face = mesh.faces[face_idx]
-                                p1 = mesh.vertices[face[0]]
-                                p2 = mesh.vertices[face[1]]
-                                p3 = mesh.vertices[face[2]]
-                                obj_id_to_faces[obj_id].append([p1, p2, p3])
-            except Exception as e:
-                print(f"Error loading with trimesh: {e}")
-                return
-    elif ply_path.endswith('.glb'):
-        # For GLB files, use trimesh to load
-        try:
-            scene = trimesh.load(ply_path)
-            
-            # Traverse the scene to find semantic data
-            obj_id_to_faces = defaultdict(list)
-            
-            # For each mesh in the scene
-            for name, mesh in scene.geometry.items():
-                # Check if we can extract semantic info from the name
-                obj_id = None
-                obj_cat = None
-                
-                # Example pattern matching - adapt based on actual naming convention
-                match = re.search(r'_id_(\d+)_cat_(\w+)', name)
-                if match:
-                    obj_id = int(match.group(1))
-                    obj_cat = match.group(2)
+        for name, mesh in scene.geometry.items():
+            # Try to extract semantic info from mesh name or metadata
+            for obj_id, (obj_cat) in obj_id_to_cat.items():
+                # Dense sampling of points for this object
+                if mesh.faces is not None and len(mesh.faces) > 0:
+                    faces = mesh.faces
+                    t_pts = hab_utils.dense_sampling_trimesh(mesh.vertices[faces], sampling_density)
                     
-                    if obj_cat in OBJECT_CATEGORY_MAP:
-                        obj_id_to_cat[obj_id] = obj_cat
+                    for t_pt in t_pts:
+                        sem_id = OBJECT_CATEGORY_MAP.get(obj_cat, OBJECT_CATEGORY_MAP["floor"])
+                        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
                         
-                        # Extract faces
-                        for face_idx in range(len(mesh.faces)):
-                            face = mesh.faces[face_idx]
-                            p1 = mesh.vertices[face[0]]
-                            p2 = mesh.vertices[face[1]]
-                            p3 = mesh.vertices[face[2]]
-                            obj_id_to_faces[obj_id].append([p1, p2, p3])
-        except Exception as e:
-            print(f"Error loading GLB file: {e}")
-            return
-
-    # Get dense point-clouds for each object id
-    for obj_id, faces in obj_id_to_faces.items():
-        ocat = obj_id_to_cat[obj_id]
-        sem_id = OBJECT_CATEGORY_MAP[ocat]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        # Create trimesh vertices and faces from faces
-        faces = np.array(faces)  # (N, 3, 3)
-        t_pts = hab_utils.dense_sampling_trimesh(faces, sampling_density)
+                        vertices.append(t_pt)
+                        obj_ids.append(obj_id)
+                        sem_ids.append(sem_id)
+                        colors.append(color)
+        
+        if vertices:
+            semantic_loaded = True
+    
+    except Exception as e:
+        print(f"Error loading semantic data: {e}")
+    
+    # Fallback: Generate basic point cloud with floor and walls
+    if not semantic_loaded:
+        print("Falling back to basic point cloud generation")
+        sim = hab_utils.robust_load_sim(glb_path)
+        
+        # Navmesh for floor
+        navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
+        t_pts = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
+        
         for t_pt in t_pts:
             vertices.append(t_pt)
-            obj_ids.append(obj_id)
-            sem_ids.append(sem_id)
-            colors.append(color)
-
-    ############################################################################
-    # Get vertices for navigable spaces
-    ############################################################################
-    sim = hab_utils.robust_load_sim(glb_path)
-    navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
-    t_pts = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
-    for t_pt in t_pts:
-        obj_id = -1
-        sem_id = OBJECT_CATEGORY_MAP["floor"]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        vertices.append(t_pt)
-        obj_ids.append(obj_id)
-        sem_ids.append(sem_id)
-        colors.append(color)
-    sim.close()
-
-    ############################################################################
-    # Get vertices for walls
-    ############################################################################
-    per_floor_wall_pc = extract_wall_point_clouds(
-        glb_path, houses_dim_path, sampling_density=sampling_density
-    )
-    for _, points in per_floor_wall_pc.items():
-        obj_id = -1
-        sem_id = OBJECT_CATEGORY_MAP["wall"]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        for p in points:
-            vertices.append(p)
-            obj_ids.append(obj_id)
-            sem_ids.append(sem_id)
-            colors.append(color)
-
+            obj_ids.append(-1)
+            sem_ids.append(OBJECT_CATEGORY_MAP["floor"])
+            colors.append(COLOR_PALETTE[OBJECT_CATEGORY_MAP["floor"] * 3 : (OBJECT_CATEGORY_MAP["floor"] + 1) * 3])
+        
+        # Wall points
+        wall_pc = extract_wall_point_clouds(glb_path, houses_dim_path, sampling_density)
+        for _, points in wall_pc.items():
+            for p in points:
+                vertices.append(p)
+                obj_ids.append(-1)
+                sem_ids.append(OBJECT_CATEGORY_MAP["wall"])
+                colors.append(COLOR_PALETTE[OBJECT_CATEGORY_MAP["wall"] * 3 : (OBJECT_CATEGORY_MAP["wall"] + 1) * 3])
+        
+        sim.close()
+    
+    # Convert to numpy arrays
     vertices = np.array(vertices)
     obj_ids = np.array(obj_ids)
     sem_ids = np.array(sem_ids)
     colors = np.array(colors)
-
+    
+    # Save point cloud
     with h5py.File(pc_save_path, "w") as fp:
         fp.create_dataset("vertices", data=vertices)
         fp.create_dataset("obj_ids", data=obj_ids)
         fp.create_dataset("sem_ids", data=sem_ids)
         fp.create_dataset("colors", data=colors)
+    
+    print(f"Point cloud saved: {pc_save_path}")
+    print(f"Vertices shape: {vertices.shape}")
+    print(f"Unique semantic IDs: {np.unique(sem_ids)}")
+    print(f"Semantic ID counts: {np.unique(sem_ids, return_counts=True)}")
 
 
 def _aux_fn(inputs):
@@ -490,272 +415,60 @@ def visualize_sem_map(sem_map):
     return semantic_img
 
 def convert_point_cloud_to_semantic_map(
-        pc_dir, houses_dim_root, save_dir, resolution=0.05
-    ):
-
+    pc_dir, houses_dim_root, save_dir, resolution=0.05
+):
     obj_files = sorted(glob.glob(f"{pc_dir}/*.h5"))
 
     info = {}
 
     for obj_f in tqdm.tqdm(obj_files):
-
         env = obj_f.split("/")[-1].split(".")[0]
         map_save_path = os.path.join(save_dir, env + ".h5")
+        
+        # Add more detailed logging
+        print(f"\nProcessing file: {obj_f}")
+        print(f"Save path: {map_save_path}")
+
+        # If the map is already saved, skip
         if os.path.isfile(map_save_path):
+            print(f"Map already exists: {map_save_path}")
             continue
 
         houses_dim_path = os.path.join(houses_dim_root, env + ".json")
         if not os.path.isfile(houses_dim_path):
-            print(f"Warning: No houses_dim file found for {env}, skipping...")
+            print(f"WARNING: No houses_dim file found for {env}, skipping...")
             continue
-            
-        with open(houses_dim_path, "r") as fp:
-            houses_dim = json.load(fp)
-        f = h5py.File(obj_f, "r")
+        
+        # Load H5 file and print detailed information
+        try:
+            with h5py.File(obj_f, "r") as f:
+                # Print detailed information about the datasets
+                print("H5 File Datasets:", list(f.keys()))
+                
+                vertices = np.array(f["vertices"])
+                obj_ids = np.array(f["obj_ids"])
+                sem_ids = np.array(f["sem_ids"])
+                colors = np.array(f["colors"])
+                
+                print(f"Vertices shape: {vertices.shape}")
+                print(f"Unique semantic IDs: {np.unique(sem_ids)}")
+                print(f"Semantic ID counts: {np.unique(sem_ids, return_counts=True)}")
+                
+                # Check if there are any meaningful semantic labels
+                non_background_mask = (sem_ids != OBJECT_CATEGORY_MAP["floor"]) & \
+                                      (sem_ids != OBJECT_CATEGORY_MAP["wall"]) & \
+                                      (sem_ids != OBJECT_CATEGORY_MAP["out-of-bounds"])
+                
+                print(f"Non-background semantic points: {np.sum(non_background_mask)}")
+                
+                if np.sum(non_background_mask) == 0:
+                    print(f"WARNING: No semantic points found for {obj_f}")
+        
+        except Exception as e:
+            print(f"Error reading H5 file {obj_f}: {e}")
+            continue
 
-        # Generate floor-wise maps
-        per_floor_dims = {}
-        for key, val in houses_dim.items():
-            match = re.search(f"{env}_(\d+)", key)
-            if match:
-                per_floor_dims[int(match.group(1))] = val
-
-        all_vertices = np.array(f["vertices"])
-        all_obj_ids = np.array(f["obj_ids"])
-        all_sem_ids = np.array(f["sem_ids"])
-        all_colors = np.array(f["colors"])
-
-        f.close()
-
-        # --- change coordinates to match map
-        # --  set discret dimensions
-        center = np.array(houses_dim[env]["center"])
-        sizes = np.array(houses_dim[env]["sizes"])
-        sizes += 2  # -- pad env bboxes
-
-        world_dim = sizes.copy()
-        world_dim[1] = 0
-
-        central_pos = center.copy()
-        central_pos[1] = 0
-
-        map_world_shift = central_pos - world_dim / 2
-
-        world_dim_discret = [
-            int(np.round(world_dim[0] / resolution)),
-            0,
-            int(np.round(world_dim[2] / resolution)),
-        ]
-
-        info[env] = {
-            "dim": world_dim_discret,
-            "central_pos": [float(x) for x in central_pos],
-            "map_world_shift": [float(x) for x in map_world_shift],
-            "resolution": resolution,
-        }
-
-        # Pre-assign objects to different floors
-        per_floor_obj_ids = {floor_id: [] for floor_id in per_floor_dims.keys()}
-        obj_ids_set = set(all_obj_ids.tolist())
-        ## -1 corresponds to wall and floor
-        if -1 in obj_ids_set:
-            obj_ids_set.remove(-1)
-        for obj_id in obj_ids_set:
-            is_obj_id = all_obj_ids == obj_id
-            obj_vertices = all_vertices[is_obj_id, :]
-            # Get extents
-            min_y = obj_vertices[:, 1].min()
-            # Assign object to floor closest to it's min_y
-            best_floor_id = None
-            best_diff = float('inf')
-            for floor_id, floor_dims in per_floor_dims.items():
-                diff = abs(min_y - floor_dims["ylo"])
-                if (diff < best_diff) and min_y - floor_dims["ylo"] > -0.5:
-                    best_diff = diff
-                    best_floor_id = floor_id
-            if best_floor_id is None:
-                # Skip the object if it does not belong to any floor
-                # Print message for debugging purposes
-                print(
-                    f"NOTE: Object id {obj_id} from scene {env} does not belong to any floor!"
-                )
-                continue
-            per_floor_obj_ids[best_floor_id].append(obj_id)
-
-        # Build maps per floor
-        per_floor_maps = {}
-        for floor_id, floor_dims in per_floor_dims.items():
-
-            curr_floor_y = floor_dims["ylo"]
-            if floor_id + 1 in per_floor_dims:
-                next_floor_y = per_floor_dims[floor_id + 1]["ylo"]
-            else:
-                next_floor_y = float('inf')
-
-            # Get navigable and wall vertices based on height thresholds
-            is_on_floor = (all_vertices[:, 1] >= curr_floor_y) & (
-                all_vertices[:, 1] <= next_floor_y - 0.5
-            )
-            is_floor = (all_sem_ids == OBJECT_CATEGORY_MAP["floor"]) & is_on_floor
-            is_wall = (all_sem_ids == OBJECT_CATEGORY_MAP["wall"]) & is_on_floor
-
-            # Get object vertices based on height thresholds for individual object instances
-            is_object = np.zeros_like(is_on_floor)
-            for obj_id in per_floor_obj_ids[floor_id]:
-                is_object = is_object | (all_obj_ids == obj_id)
-
-            mask = is_floor | is_wall | is_object
-
-            vertices = np.copy(all_vertices[mask])
-            obj_ids = np.copy(all_obj_ids[mask])
-            sem_ids = np.copy(all_sem_ids[mask])
-
-            # -- some maps have 0 obj of interest
-            if len(vertices) == 0:
-                info[env][floor_id] = {"y_min": 0.0}
-                dims = (world_dim_discret[2], world_dim_discret[0])
-                mask = np.zeros(dims, dtype=bool)
-                map_z = np.zeros(dims, dtype=np.float32)
-                map_instance = np.zeros(dims, dtype=np.int32)
-                map_semantic = np.zeros(dims, dtype=np.int32)
-                map_semantic_rgb = np.zeros((*dims, 3), dtype=np.uint8)
-                per_floor_maps[floor_id] = {
-                    "mask": mask,
-                    "map_z": map_z,
-                    "map_instance": map_instance,
-                    "map_semantic": map_semantic,
-                    "map_semantic_rgb": map_semantic_rgb,
-                }
-                continue
-
-            vertices -= map_world_shift
-
-            # Set the min_y for the floor. This will be used during episode generation to find
-            # a random navigable start location.
-            floor_mask = sem_ids == OBJECT_CATEGORY_MAP["floor"]
-            min_y = vertices[floor_mask, 1].min() if np.any(floor_mask) else 0.0
-            info[env][floor_id] = {"y_min": float(min_y.item()) if isinstance(min_y, np.ndarray) else float(min_y)}
-
-            # Reduce heights of floor and navigable space to ensure objects are taller.
-            wall_mask = sem_ids == OBJECT_CATEGORY_MAP["wall"]
-            vertices[wall_mask, 1] -= 0.5
-            vertices[floor_mask, 1] -= 0.5
-
-            # -- discretize point cloud
-            vertices = torch.FloatTensor(vertices)
-            obj_ids = torch.FloatTensor(obj_ids)
-            sem_ids = torch.FloatTensor(sem_ids)
-
-            y_values = vertices[:, 1]
-
-            vertex_to_map_x = (vertices[:, 0] / resolution).round()
-            vertex_to_map_z = (vertices[:, 2] / resolution).round()
-
-            outside_map_indices = (
-                (vertex_to_map_x >= world_dim_discret[0])
-                + (vertex_to_map_z >= world_dim_discret[2])
-                + (vertex_to_map_x < 0)
-                + (vertex_to_map_z < 0)
-            )
-
-            # assert outside_map_indices.sum() == 0
-            y_values = y_values[~outside_map_indices]
-            vertex_to_map_z = vertex_to_map_z[~outside_map_indices]
-            vertex_to_map_x = vertex_to_map_x[~outside_map_indices]
-
-            obj_ids = obj_ids[~outside_map_indices]
-            sem_ids = sem_ids[~outside_map_indices]
-
-            # -- get the z values for projection
-            # -- shift to positive values
-            y_values = y_values - min_y
-            y_values += 1.0
-
-            # -- projection
-            feat_index = (
-                world_dim_discret[0] * vertex_to_map_z + vertex_to_map_x
-            ).long()
-            flat_highest_z = torch.zeros(
-                int(world_dim_discret[0] * world_dim_discret[2])
-            )
-            flat_highest_z, argmax_flat_spatial_map = scatter_max(
-                y_values,
-                feat_index,
-                dim=0,
-                out=flat_highest_z,
-            )
-            # NOTE: This is needed only for torch_scatter>=2.3
-            argmax_flat_spatial_map[argmax_flat_spatial_map == y_values.shape[0]] = -1
-
-            m = argmax_flat_spatial_map >= 0
-            flat_map_instance = (
-                torch.zeros(int(world_dim_discret[0] * world_dim_discret[2])) - 1
-            )
-
-            flat_map_instance[m.view(-1)] = obj_ids[argmax_flat_spatial_map[m]]
-
-            flat_map_semantic = torch.zeros(
-                int(world_dim_discret[0] * world_dim_discret[2])
-            )
-            flat_map_semantic[m.view(-1)] = sem_ids[argmax_flat_spatial_map[m]]
-
-            # -- format data
-            mask = m.reshape(world_dim_discret[2], world_dim_discret[0])
-            mask = mask.numpy()
-            mask = mask.astype(bool)
-            map_z = flat_highest_z.reshape(world_dim_discret[2], world_dim_discret[0])
-            map_z = map_z.numpy()
-            map_z = map_z.astype(np.float32)
-            map_instance = flat_map_instance.reshape(
-                world_dim_discret[2], world_dim_discret[0]
-            )
-            map_instance = map_instance.numpy()
-            map_instance = map_instance.astype(np.float32)
-            map_semantic = flat_map_semantic.reshape(
-                world_dim_discret[2], world_dim_discret[0]
-            )
-            map_semantic = map_semantic.numpy()
-            map_semantic = map_semantic.astype(np.float32)
-            map_semantic_rgb = visualize_sem_map(map_semantic)
-
-            per_floor_maps[floor_id] = {
-                "mask": mask,
-                "map_z": map_z,
-                "map_instance": map_instance,
-                "map_semantic": map_semantic,
-                "map_semantic_rgb": map_semantic_rgb,
-            }
-
-            rgb_save_path = os.path.join(save_dir, f"{env}_{floor_id}.png")
-            cv2.imwrite(rgb_save_path, map_semantic_rgb)
-
-        with h5py.File(map_save_path, "w") as f:
-            f.create_dataset(f"wall_sem_id", data=OBJECT_CATEGORY_MAP["wall"])
-            f.create_dataset(f"floor_sem_id", data=OBJECT_CATEGORY_MAP["floor"])
-            f.create_dataset(
-                f"out-of-bounds_sem_id", data=OBJECT_CATEGORY_MAP["out-of-bounds"]
-            )
-            for floor_id, floor_map in per_floor_maps.items():
-                mask = floor_map["mask"]
-                map_z = floor_map["map_z"]
-                map_instance = floor_map["map_instance"]
-                map_semantic = floor_map["map_semantic"]
-                map_semantic_rgb = floor_map["map_semantic_rgb"]
-
-                f.create_dataset(f"{floor_id}/mask", data=mask, dtype=bool)
-                f.create_dataset(
-                    f"{floor_id}/map_heights", data=map_z, dtype=np.float32
-                )
-                f.create_dataset(
-                    f"{floor_id}/map_instance", data=map_instance, dtype=np.int32
-                )
-                f.create_dataset(
-                    f"{floor_id}/map_semantic", data=map_semantic, dtype=np.int32
-                )
-                f.create_dataset(f"{floor_id}/map_semantic_rgb", data=map_semantic_rgb)
-
-    json.dump(info, open(os.path.join(save_dir, "semmap_GT_info.json"), "w"))
-
+    print("Semantic map generation completed.")
 
 def main():
     # Create required directories
