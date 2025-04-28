@@ -1,7 +1,7 @@
 import numpy as np
 
 
-REGISTERED_DATASETS = ["gibson", "mp3d"]
+REGISTERED_DATASETS = ["gibson", "mp3d","hm3d"]
 SPLIT_SCENES = {
     "gibson": {
         "train": [
@@ -112,6 +112,22 @@ SPLIT_SCENES = {
             "zsNo4HB9uLZ",
         ],
     },
+    "hm3d": {
+        "train": [
+            # Add your HM3D training scenes here
+            "00800-TEEsavR23oF",
+            "00801-HaxA7YrQdEC",
+            "00802-wcojb4TFT35",
+            # Add more as needed
+        ],
+        "val": [
+            # Add your HM3D validation scenes here
+            "00807-y9hTuugGdiq",
+            "00808-8SxtPFQ2Swz",
+            "00809-mvhqRH5fPVu",
+            # Add more as needed
+        ],
+    },
 }
 OBJECT_CATEGORIES = {
     "gibson": [
@@ -157,6 +173,31 @@ OBJECT_CATEGORIES = {
         "gym_equipment",
         "seating",
         "clothes ",
+    ],
+    "hm3d": [
+        "floor",
+        "wall",
+        "chair",
+        "table",
+        "picture",
+        "cabinet",
+        "cushion",
+        "sofa",
+        "bed",
+        "chest_of_drawers",
+        "plant",
+        "sink",
+        "toilet",
+        "stool",
+        "towel",
+        "tv_monitor",
+        "shower",
+        "bathtub",
+        "counter",
+        "fireplace",
+        "gym_equipment",
+        "seating",
+        "clothes",
     ],
 }
 OBJECT_CATEGORY_MAP = {}

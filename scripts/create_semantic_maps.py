@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import glob
 import json
 import math
@@ -24,82 +26,41 @@ from plyfile import PlyData
 
 from poni.constants import d3_40_colors_rgb, OBJECT_CATEGORIES, SPLIT_SCENES
 
+# Set seed for reproducibility
 random.seed(123)
 
-################################################################################
-# Gibson constants
-################################################################################
-GIBSON_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["gibson"]
-GIBSON_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(GIBSON_CATEGORIES)}
-GIBSON_OBJECT_COLORS = [
-    (0.9400000000000001, 0.7818, 0.66),
-    (0.9400000000000001, 0.8868, 0.66),
-    (0.8882000000000001, 0.9400000000000001, 0.66),
-    (0.7832000000000001, 0.9400000000000001, 0.66),
-    (0.6782000000000001, 0.9400000000000001, 0.66),
-    (0.66, 0.9400000000000001, 0.7468000000000001),
-    (0.66, 0.9400000000000001, 0.8518000000000001),
-    (0.66, 0.9232, 0.9400000000000001),
-    (0.66, 0.8182, 0.9400000000000001),
-    (0.66, 0.7132, 0.9400000000000001),
-    (0.7117999999999999, 0.66, 0.9400000000000001),
-    (0.8168, 0.66, 0.9400000000000001),
-    (0.9218, 0.66, 0.9400000000000001),
-    (0.9400000000000001, 0.66, 0.8531999999999998),
-    (0.9400000000000001, 0.66, 0.748199999999999),
-]
-################################################################################
-# MP3D constants
-################################################################################
-MP3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["mp3d"]
-MP3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(MP3D_CATEGORIES)}
-MP3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
-for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
-    color = (color.astype(np.float32) / 255.0).tolist()
-    MP3D_OBJECT_COLORS.append(color)
+# Make sure we're working with HM3D
+os.environ["ACTIVE_DATASET"] = "hm3d"
+ACTIVE_DATASET = "hm3d"
 
-################################################################################
+# HM3D constants
+HM3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["hm3d"]
+HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(HM3D_CATEGORIES)}
+HM3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
+for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
+    color = (color.astype(np.float32) / 255.0).tolist()
+    HM3D_OBJECT_COLORS.append(color)
+
 # General constants
-################################################################################
-assert "ACTIVE_DATASET" in os.environ
-ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson
-if ACTIVE_DATASET == "mp3d":
-    OBJECT_COLORS = MP3D_OBJECT_COLORS
-    OBJECT_CATEGORIES = MP3D_CATEGORIES
-    OBJECT_CATEGORY_MAP = MP3D_CATEGORY_MAP
-    SCENES_ROOT = "data/scene_datasets/mp3d_uncompressed"
-    SB_SAVE_ROOT = "data/semantic_maps/mp3d/scene_boundaries"
-    PC_SAVE_ROOT = "data/semantic_maps/mp3d/point_clouds"
-    SEM_SAVE_ROOT = "data/semantic_maps/mp3d/semantic_maps"
-    NUM_WORKERS = 8
-    MAX_TASKS_PER_CHILD = 2
-    SAMPLING_RESOLUTION = 0.20
-    WALL_THRESH = [0.25, 1.25]
-else:
-    OBJECT_COLORS = GIBSON_OBJECT_COLORS
-    OBJECT_CATEGORIES = GIBSON_CATEGORIES
-    OBJECT_CATEGORY_MAP = GIBSON_CATEGORY_MAP
-    SCENES_ROOT = "data/scene_datasets/gibson_semantic"
-    SB_SAVE_ROOT = "data/semantic_maps/gibson/scene_boundaries"
-    PC_SAVE_ROOT = "data/semantic_maps/gibson/point_clouds"
-    SEM_SAVE_ROOT = "data/semantic_maps/gibson/semantic_maps"
-    NUM_WORKERS = 12
-    MAX_TASKS_PER_CHILD = None
-    SAMPLING_RESOLUTION = 0.10
-    WALL_THRESH = [0.25, 1.25]
+OBJECT_COLORS = HM3D_OBJECT_COLORS
+OBJECT_CATEGORIES = HM3D_CATEGORIES
+OBJECT_CATEGORY_MAP = HM3D_CATEGORY_MAP
+SCENES_ROOT = "data/scene_datasets/hm3d/train"
+SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
+PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
+SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
+NUM_WORKERS = 8
+MAX_TASKS_PER_CHILD = 2
+SAMPLING_RESOLUTION = 0.20
+WALL_THRESH = [0.25, 1.25]
 
 COLOR_PALETTE = [
-    1.0,
-    1.0,
-    1.0,  # Out-of-bounds
-    0.9,
-    0.9,
-    0.9,  # Floor
-    0.3,
-    0.3,
-    0.3,  # Wall
+    1.0, 1.0, 1.0,  # Out-of-bounds
+    0.9, 0.9, 0.9,  # Floor
+    0.3, 0.3, 0.3,  # Wall
     *[oci for oc in OBJECT_COLORS for oci in oc],
 ]
+
 LEGEND_PALETTE = [
     (1.0, 1.0, 1.0),  # Out-of-bounds
     (0.9, 0.9, 0.9),  # Floor
@@ -180,20 +141,103 @@ def extract_scene_point_clouds(
     colors = []
     obj_ids = []
     sem_ids = []
-    ply_data = PlyData.read(ply_path)
-    # Get faces for each object id
-    obj_id_to_faces = defaultdict(list)
-    for face in ply_data["face"]:
-        vids = list(face[0])
-        obj_id = face[1]
-        if obj_id in obj_id_to_cat:
-            p1 = ply_data["vertex"][vids[0]]
-            p1 = [p1[0], p1[2], -p1[1]]
-            p2 = ply_data["vertex"][vids[1]]
-            p2 = [p2[0], p2[2], -p2[1]]
-            p3 = ply_data["vertex"][vids[2]]
-            p3 = [p3[0], p3[2], -p3[1]]
-            obj_id_to_faces[obj_id].append([p1, p2, p3])
+    
+    # Check if ply_path exists, for HM3D it might be a different extension
+    if not os.path.exists(ply_path):
+        print(f"Warning: PLY file does not exist: {ply_path}")
+        # Try to find an appropriate semantic file for HM3D
+        base_path = os.path.splitext(glb_path)[0]
+        potential_paths = [
+            f"{base_path}_semantic.ply",
+            f"{base_path}.semantic.ply",
+            f"{base_path}_semantic.glb",
+            f"{base_path}.semantic.glb",
+        ]
+        
+        for path in potential_paths:
+            if os.path.exists(path):
+                ply_path = path
+                print(f"Found alternative semantic file: {ply_path}")
+                break
+        
+        if not os.path.exists(ply_path):
+            print(f"Error: Could not find semantic file for {glb_path}")
+            return
+    
+    # For HM3D, the semantic files may be in a different format
+    # We'll need to adapt based on the file type
+    if ply_path.endswith('.ply'):
+        try:
+            ply_data = PlyData.read(ply_path)
+            # Get faces for each object id
+            obj_id_to_faces = defaultdict(list)
+            for face in ply_data["face"]:
+                vids = list(face[0])
+                obj_id = face[1]
+                if obj_id in obj_id_to_cat:
+                    p1 = ply_data["vertex"][vids[0]]
+                    p1 = [p1[0], p1[2], -p1[1]]
+                    p2 = ply_data["vertex"][vids[1]]
+                    p2 = [p2[0], p2[2], -p2[1]]
+                    p3 = ply_data["vertex"][vids[2]]
+                    p3 = [p3[0], p3[2], -p3[1]]
+                    obj_id_to_faces[obj_id].append([p1, p2, p3])
+        except Exception as e:
+            print(f"Error reading PLY file: {e}")
+            # If PLY reading fails, try loading with trimesh
+            try:
+                mesh = trimesh.load(ply_path)
+                # Try to extract semantic information
+                if hasattr(mesh, 'metadata') and 'semantic' in mesh.metadata:
+                    # Extract semantic data from trimesh
+                    for obj_id, obj_data in mesh.metadata['semantic'].items():
+                        if 'category' in obj_data and obj_data['category'] in OBJECT_CATEGORY_MAP:
+                            # Extract faces for this object
+                            obj_id_to_faces[obj_id] = []
+                            # This is an example, you'll need to adapt based on actual data structure
+                            for face_idx in obj_data.get('face_indices', []):
+                                face = mesh.faces[face_idx]
+                                p1 = mesh.vertices[face[0]]
+                                p2 = mesh.vertices[face[1]]
+                                p3 = mesh.vertices[face[2]]
+                                obj_id_to_faces[obj_id].append([p1, p2, p3])
+            except Exception as e:
+                print(f"Error loading with trimesh: {e}")
+                return
+    elif ply_path.endswith('.glb'):
+        # For GLB files, use trimesh to load
+        try:
+            scene = trimesh.load(ply_path)
+            
+            # Traverse the scene to find semantic data
+            obj_id_to_faces = defaultdict(list)
+            
+            # For each mesh in the scene
+            for name, mesh in scene.geometry.items():
+                # Check if we can extract semantic info from the name
+                obj_id = None
+                obj_cat = None
+                
+                # Example pattern matching - adapt based on actual naming convention
+                match = re.search(r'_id_(\d+)_cat_(\w+)', name)
+                if match:
+                    obj_id = int(match.group(1))
+                    obj_cat = match.group(2)
+                    
+                    if obj_cat in OBJECT_CATEGORY_MAP:
+                        obj_id_to_cat[obj_id] = obj_cat
+                        
+                        # Extract faces
+                        for face_idx in range(len(mesh.faces)):
+                            face = mesh.faces[face_idx]
+                            p1 = mesh.vertices[face[0]]
+                            p2 = mesh.vertices[face[1]]
+                            p3 = mesh.vertices[face[2]]
+                            obj_id_to_faces[obj_id].append([p1, p2, p3])
+        except Exception as e:
+            print(f"Error loading GLB file: {e}")
+            return
+
     # Get dense point-clouds for each object id
     for obj_id, faces in obj_id_to_faces.items():
         ocat = obj_id_to_cat[obj_id]
@@ -664,33 +708,60 @@ def convert_point_cloud_to_semantic_map(
 
 
 if __name__ == "__main__":
+    # Make sure PONI_ROOT is set
+    if "PONI_ROOT" not in os.environ:
+        print("Please set PONI_ROOT environment variable")
+        sys.exit(1)
+    
+    PONI_ROOT = os.environ["PONI_ROOT"]
+    SCENES_ROOT = os.path.join(PONI_ROOT, "data/scene_datasets/hm3d_uncompressed")
+    SB_SAVE_ROOT = os.path.join(PONI_ROOT, "data/semantic_maps/hm3d/scene_boundaries")
+    PC_SAVE_ROOT = os.path.join(PONI_ROOT, "data/semantic_maps/hm3d/point_clouds")
+    SEM_SAVE_ROOT = os.path.join(PONI_ROOT, "data/semantic_maps/hm3d/semantic_maps")
+    
+    # Ensure all save directories exist
+    os.makedirs(SB_SAVE_ROOT, exist_ok=True)
+    os.makedirs(PC_SAVE_ROOT, exist_ok=True)
+    os.makedirs(SEM_SAVE_ROOT, exist_ok=True)
+    
     scene_paths = sorted(
         glob.glob(
             os.path.join(SCENES_ROOT, "**/*.glb"),
             recursive=True,
         )
     )
-    # Select only scenes that have corresponding semantics
-    scene_paths = list(
-        filter(
-            lambda x: os.path.isfile(x.replace(".glb", "_semantic.ply")), scene_paths
-        )
-    )
-
-    # Select only scenes from the train and val splits
-    valid_scenes = (
-        SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
-    )
+    
+    # Select only scenes that have corresponding semantics (or might have them)
+    valid_scene_paths = []
+    for scene_path in scene_paths:
+        base_path = os.path.splitext(scene_path)[0]
+        potential_paths = [
+            f"{base_path}_semantic.ply",
+            f"{base_path}.semantic.ply",
+            f"{base_path}_semantic.glb",
+            f"{base_path}.semantic.glb",
+        ]
+        
+        semantic_exists = False
+        for path in potential_paths:
+            if os.path.exists(path):
+                semantic_exists = True
+                break
+        
+        if semantic_exists:
+            valid_scene_paths.append(scene_path)
+    
+    scene_paths = valid_scene_paths
+    
+    # Get scenes from the train and val splits
+    valid_scenes = SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
     scene_paths = list(
         filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes, scene_paths)
     )
-
+    
     print(f"Number of available scenes: {len(scene_paths)}")
-
-    context = mp.get_context("forkserver")
-    pool = context.Pool(NUM_WORKERS, maxtasksperchild=MAX_TASKS_PER_CHILD)
-
-    # Extract scene_boundaries
+    
+    # Extract scene boundaries
     os.makedirs(SB_SAVE_ROOT, exist_ok=True)
     print("===========> Extracting scene boundaries")
     inputs = []
@@ -699,17 +770,38 @@ if __name__ == "__main__":
         save_path = os.path.join(SB_SAVE_ROOT, f"{scene_name}.json")
         if not os.path.isfile(save_path):
             inputs.append((scene_path, save_path))
+    
+    # Use multiprocessing for scene boundary extraction
+    context = mp.get_context("forkserver")
+    pool = context.Pool(NUM_WORKERS, maxtasksperchild=MAX_TASKS_PER_CHILD)
     _ = list(tqdm.tqdm(pool.imap(get_scene_boundaries, inputs), total=len(inputs)))
-
+    
     # Generate point-clouds for each scene
     os.makedirs(PC_SAVE_ROOT, exist_ok=True)
     print("===========> Extracting point-clouds")
     inputs = []
     for scene_path in scene_paths:
-        ply_path = scene_path.replace(".glb", "_semantic.ply")
+        # Look for semantic file variations
+        base_path = os.path.splitext(scene_path)[0]
+        ply_path = f"{base_path}_semantic.ply"  # Default assumption
+        
+        # Check other possible semantic file locations
+        if not os.path.exists(ply_path):
+            alternative_paths = [
+                f"{base_path}.semantic.ply",
+                f"{base_path}_semantic.glb",
+                f"{base_path}.semantic.glb",
+            ]
+            
+            for alt_path in alternative_paths:
+                if os.path.exists(alt_path):
+                    ply_path = alt_path
+                    break
+        
         scn_path = scene_path.replace(".glb", ".scn")
         scene_name = scene_path.split("/")[-1].split(".")[0]
         pc_save_path = os.path.join(PC_SAVE_ROOT, f"{scene_name}.h5")
+        
         if not os.path.isfile(pc_save_path):
             inputs.append(
                 (
@@ -721,10 +813,13 @@ if __name__ == "__main__":
                     pc_save_path,
                 )
             )
-
+    
     _ = list(tqdm.tqdm(pool.imap(_aux_fn, inputs), total=len(inputs)))
-
+    
     # Extract semantic maps
     os.makedirs(SEM_SAVE_ROOT, exist_ok=True)
     print("===========> Extracting semantic maps")
     convert_point_cloud_to_semantic_map(PC_SAVE_ROOT, SB_SAVE_ROOT, SEM_SAVE_ROOT)
+    
+    print("===========> Done!")
+    print(f"HM3D semantic maps have been created in {SEM_SAVE_ROOT}")
