@@ -89,7 +89,7 @@ def get_args():
         "-v",
         "--visualize",
         type=int,
-        default=0,
+        default=2,
         help="""1: Render the observation and
                                    the predicted semantic map,
                                 2: Render the observation with semantic
@@ -97,7 +97,7 @@ def get_args():
                                 (default: 0)""",
     )
     parser.add_argument(
-        "--print_images", type=int, default=0, help="1: save visualization as images"
+        "--print_images", type=int, default=1, help="1: save visualization as images"
     )
 
     # Environment, dataset and episode specifications
