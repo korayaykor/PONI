@@ -62,7 +62,7 @@ for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
 # HM3D constants
 ################################################################################
 HM3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["hm3d"]
-HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(MP3D_CATEGORIES)}
+HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(HM3D_CATEGORIES)}
 HM3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
 for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
     color = (color.astype(np.float32) / 255.0).tolist()
@@ -704,9 +704,18 @@ if __name__ == "__main__":
     valid_scenes = (
         SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
     )
+    # --- Düzeltilmiş Filtreleme ---
+    def get_scene_id_from_path(path):
+        basename = os.path.basename(path).split(".")[0]
+        # Eğer isimde '-' varsa, son '-' sonrasını al, yoksa tamamını al
+        if '-' in basename:
+            return basename.split('-')[-1]
+        return basename
+
     scene_paths = list(
-        filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes, scene_paths)
+        filter(lambda x: get_scene_id_from_path(x) in valid_scenes, scene_paths)
     )
+    # --- Düzeltme Sonu ---
 
     print(f"Number of available scenes: {len(scene_paths)}")
 
