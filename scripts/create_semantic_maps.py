@@ -57,6 +57,17 @@ MP3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
 for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
     color = (color.astype(np.float32) / 255.0).tolist()
     MP3D_OBJECT_COLORS.append(color)
+    
+################################################################################
+# HM3D constants
+################################################################################
+HM3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["hm3d"]
+HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(MP3D_CATEGORIES)}
+HM3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
+for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
+    color = (color.astype(np.float32) / 255.0).tolist()
+    HM3D_OBJECT_COLORS.append(color)
+
 
 ################################################################################
 # General constants
@@ -71,6 +82,18 @@ if ACTIVE_DATASET == "mp3d":
     SB_SAVE_ROOT = "data/semantic_maps/mp3d/scene_boundaries"
     PC_SAVE_ROOT = "data/semantic_maps/mp3d/point_clouds"
     SEM_SAVE_ROOT = "data/semantic_maps/mp3d/semantic_maps"
+    NUM_WORKERS = 8
+    MAX_TASKS_PER_CHILD = 2
+    SAMPLING_RESOLUTION = 0.20
+    WALL_THRESH = [0.25, 1.25]
+elif ACTIVE_DATASET == "hm3d":
+    OBJECT_COLORS = HM3D_OBJECT_COLORS
+    OBJECT_CATEGORIES = HM3D_CATEGORIES
+    OBJECT_CATEGORY_MAP = HM3D_CATEGORY_MAP
+    SCENES_ROOT = "data/scene_datasets/hm3d"
+    SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
+    PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
+    SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
     NUM_WORKERS = 8
     MAX_TASKS_PER_CHILD = 2
     SAMPLING_RESOLUTION = 0.20
