@@ -59,15 +59,14 @@ for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
     MP3D_OBJECT_COLORS.append(color)
     
 ################################################################################
-# HM3D constants
+# MP3D constants
 ################################################################################
 HM3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["hm3d"]
-HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(HM3D_CATEGORIES)}
+HM3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(MP3D_CATEGORIES)}
 HM3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
 for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
     color = (color.astype(np.float32) / 255.0).tolist()
     HM3D_OBJECT_COLORS.append(color)
-
 
 ################################################################################
 # General constants
@@ -90,13 +89,13 @@ elif ACTIVE_DATASET == "hm3d":
     OBJECT_COLORS = HM3D_OBJECT_COLORS
     OBJECT_CATEGORIES = HM3D_CATEGORIES
     OBJECT_CATEGORY_MAP = HM3D_CATEGORY_MAP
-    SCENES_ROOT = "data/scene_datasets/hm3d"
+    SCENES_ROOT = "data/scene_datasets/hm3d_semantic"
     SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
     PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
     SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
     NUM_WORKERS = 8
     MAX_TASKS_PER_CHILD = 2
-    SAMPLING_RESOLUTION = 0.20
+    SAMPLING_RESOLUTION = 0.10
     WALL_THRESH = [0.25, 1.25]
 else:
     OBJECT_COLORS = GIBSON_OBJECT_COLORS
@@ -348,7 +347,7 @@ def extract_wall_point_clouds(
         floor_x_disc = np.around(floor_pc[:, 0] / grid_size).astype(np.int32)
         floor_z_disc = np.around(floor_pc[:, 2] / grid_size).astype(np.int32)
         floor_y = floor_pc[:, 1]
-        mask = np.zeros(floor_y.shape[0], dtype=np.bool_)
+        mask = np.zeros(floor_y.shape[0], dtype=np.bool)
         for i, (x_disc, z_disc, y) in enumerate(
             zip(floor_x_disc, floor_z_disc, floor_y)
         ):
@@ -704,18 +703,9 @@ if __name__ == "__main__":
     valid_scenes = (
         SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
     )
-    # --- Düzeltilmiş Filtreleme ---
-    def get_scene_id_from_path(path):
-        basename = os.path.basename(path).split(".")[0]
-        # Eğer isimde '-' varsa, son '-' sonrasını al, yoksa tamamını al
-        if '-' in basename:
-            return basename.split('-')[-1]
-        return basename
-
     scene_paths = list(
-        filter(lambda x: get_scene_id_from_path(x) in valid_scenes, scene_paths)
+        filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes, scene_paths)
     )
-    # --- Düzeltme Sonu ---
 
     print(f"Number of available scenes: {len(scene_paths)}")
 
