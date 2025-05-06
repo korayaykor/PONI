@@ -115,7 +115,7 @@ SPLIT_SCENES = {
     },
     "hm3d": {
         "train": [
-            "00000-kfPV7w3FaU5"
+            "kfPV7w3FaU5"
             "kEL17iFsVbw",
             "GtM3JtRvvvR",
             "boJrpwDQtu9",

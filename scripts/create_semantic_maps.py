@@ -72,7 +72,7 @@ for color in d3_40_colors_rgb[: len(HM3D_CATEGORIES) - 3]:
 # General constants
 ################################################################################
 assert "ACTIVE_DATASET" in os.environ
-ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson
+ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson / hm3d
 if ACTIVE_DATASET == "mp3d":
     OBJECT_COLORS = MP3D_OBJECT_COLORS
     OBJECT_CATEGORIES = MP3D_CATEGORIES
@@ -89,7 +89,7 @@ elif ACTIVE_DATASET == "hm3d":
     OBJECT_COLORS = HM3D_OBJECT_COLORS
     OBJECT_CATEGORIES = HM3D_CATEGORIES
     OBJECT_CATEGORY_MAP = HM3D_CATEGORY_MAP
-    SCENES_ROOT = "data/scene_datasets/hm3d_semantic"
+    SCENES_ROOT = "data/scene_datasets/hm3d_uncompressed"
     SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
     PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
     SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
@@ -360,7 +360,202 @@ def extract_wall_point_clouds(
         per_floor_point_clouds[floor_id] = floor_pc[mask]
 
     return per_floor_point_clouds
+def extract_hm3d_scene_point_clouds(
+    glb_path,
+    semantic_glb_path,
+    semantic_txt_path,
+    houses_dim_path,
+    pc_save_path,
+    sampling_density=1600.0,
+):
+    print(f"Scene: {glb_path}")
+    
+    # Get mapping from object instance id to category
+    obj_id_to_cat = {}
+    category_id_mapping = {}
+    
+    # Parse the semantic.txt file to get mapping from instance IDs to categories
+    if os.path.isfile(semantic_txt_path):
+        with open(semantic_txt_path, 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    obj_id = int(parts[0])
+                    obj_cat = ' '.join(parts[1:])
+                    
+                    # Map to our category system if possible
+                    mapped_cat = None
+                    # Check exact match
+                    if obj_cat in OBJECT_CATEGORY_MAP:
+                        mapped_cat = obj_cat
+                    else:
+                        # Try partial matches for common objects
+                        lower_cat = obj_cat.lower()
+                        for known_cat in OBJECT_CATEGORY_MAP.keys():
+                            if known_cat != "out-of-bounds" and known_cat != "floor" and known_cat != "wall":
+                                if known_cat in lower_cat or lower_cat in known_cat:
+                                    mapped_cat = known_cat
+                                    break
+                    
+                    if mapped_cat:
+                        obj_id_to_cat[obj_id] = mapped_cat
+                        category_id_mapping[obj_id] = OBJECT_CATEGORY_MAP[mapped_cat]
+    
+    # Load the main scene for navigation and wall extraction
+    sim = hab_utils.robust_load_sim(glb_path)
+    
+    ############################################################################
+    # Get vertices for all objects
+    ############################################################################
+    vertices = []
+    colors = []
+    obj_ids = []
+    sem_ids = []
+    
+    # Process semantic mesh if it exists
+    if os.path.isfile(semantic_glb_path):
+        try:
+            # Load semantic mesh
+            semantic_mesh = trimesh.load(semantic_glb_path)
+            
+            # Check if it's a scene with multiple meshes
+            if hasattr(semantic_mesh, 'geometry'):
+                # Process each submesh
+                for mesh_name, mesh in semantic_mesh.geometry.items():
+                    # Try to extract object ID from mesh name
+                    try:
+                        # Look for patterns like 'object_NNN' or similar
+                        import re
+                        match = re.search(r'_(\d+)', mesh_name)
+                        if match:
+                            obj_id = int(match.group(1))
+                        else:
+                            obj_id = -2  # Unknown object
+                    except:
+                        obj_id = -2  # Unknown object
+                    
+                    # Skip if we can't map this object to a category
+                    if obj_id not in category_id_mapping and obj_id != -1:
+                        # Check if it's a wall or floor based on name
+                        if "wall" in mesh_name.lower():
+                            sem_id = OBJECT_CATEGORY_MAP["wall"]
+                        elif "floor" in mesh_name.lower():
+                            sem_id = OBJECT_CATEGORY_MAP["floor"]
+                        else:
+                            continue  # Skip unknown objects
+                    else:
+                        sem_id = category_id_mapping.get(obj_id, OBJECT_CATEGORY_MAP["out-of-bounds"])
+                    
+                    # Get color for this semantic ID
+                    color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
+                    
+                    # Sample points from mesh
+                    if hasattr(mesh, 'triangles') and len(mesh.triangles) > 0:
+                        t_pts = hab_utils.dense_sampling_trimesh(mesh.triangles, sampling_density)
+                        
+                        # HM3D uses a different coordinate system than MP3D
+                        # This might need adjustment based on your observations
+                        for t_pt in t_pts:
+                            vertices.append(t_pt)
+                            obj_ids.append(obj_id)
+                            sem_ids.append(sem_id)
+                            colors.append(color)
+            else:
+                # It's a single mesh, so we need to understand how the semantic info is stored
+                # This is a simplified approach and might need customization
+                if hasattr(semantic_mesh, 'visual') and hasattr(semantic_mesh.visual, 'vertex_colors'):
+                    # If semantic info is stored in vertex colors
+                    for i, vertex in enumerate(semantic_mesh.vertices):
+                        # Extract semantic ID from vertex color (implementation depends on format)
+                        # This is just an example - adjust according to your data
+                        color = semantic_mesh.visual.vertex_colors[i]
+                        obj_id = color[0]  # Example: using red channel as object ID
+                        
+                        if obj_id in category_id_mapping:
+                            sem_id = category_id_mapping[obj_id]
+                        else:
+                            # Default to floor if unknown
+                            sem_id = OBJECT_CATEGORY_MAP["floor"]
+                        
+                        vertices.append(vertex)
+                        obj_ids.append(obj_id)
+                        sem_ids.append(sem_id)
+                        colors.append(COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3])
+                elif hasattr(semantic_mesh, 'triangles') and len(semantic_mesh.triangles) > 0:
+                    # If it's just a mesh without semantic info, sample points
+                    t_pts = hab_utils.dense_sampling_trimesh(semantic_mesh.triangles, sampling_density)
+                    # Default to floor category
+                    sem_id = OBJECT_CATEGORY_MAP["floor"]
+                    for t_pt in t_pts:
+                        vertices.append(t_pt)
+                        obj_ids.append(-1)  # Unknown object ID
+                        sem_ids.append(sem_id)
+                        colors.append(COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3])
+        except Exception as e:
+            print(f"Error processing semantic mesh: {e}")
+    
+    ############################################################################
+    # Get vertices for navigable spaces
+    ############################################################################
+    try:
+        navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
+        t_pts = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
+        for t_pt in t_pts:
+            obj_id = -1
+            sem_id = OBJECT_CATEGORY_MAP["floor"]
+            color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
+            vertices.append(t_pt)
+            obj_ids.append(obj_id)
+            sem_ids.append(sem_id)
+            colors.append(color)
+    except Exception as e:
+        print(f"Error extracting navigable spaces: {e}")
 
+    ############################################################################
+    # Get vertices for walls
+    ############################################################################
+    try:
+        per_floor_wall_pc = extract_wall_point_clouds(
+            glb_path, houses_dim_path, sampling_density=sampling_density
+        )
+        for _, points in per_floor_wall_pc.items():
+            obj_id = -1
+            sem_id = OBJECT_CATEGORY_MAP["wall"]
+            color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
+            for p in points:
+                vertices.append(p)
+                obj_ids.append(obj_id)
+                sem_ids.append(sem_id)
+                colors.append(color)
+    except Exception as e:
+        print(f"Error extracting wall point clouds: {e}")
+    
+    # Close simulator
+    sim.close()
+    
+    # Convert lists to numpy arrays
+    if len(vertices) == 0:
+        # Handle empty case - create minimal valid data
+        print(f"WARNING: No points extracted for {glb_path}")
+        vertices = np.array([[0, 0, 0]])
+        obj_ids = np.array([-1])
+        sem_ids = np.array([OBJECT_CATEGORY_MAP["floor"]])
+        colors = np.array([COLOR_PALETTE[OBJECT_CATEGORY_MAP["floor"] * 3 : (OBJECT_CATEGORY_MAP["floor"] + 1) * 3]])
+    else:
+        vertices = np.array(vertices)
+        obj_ids = np.array(obj_ids)
+        sem_ids = np.array(sem_ids)
+        colors = np.array(colors)
+
+    # Save point cloud data
+    with h5py.File(pc_save_path, "w") as fp:
+        fp.create_dataset("vertices", data=vertices)
+        fp.create_dataset("obj_ids", data=obj_ids)
+        fp.create_dataset("sem_ids", data=sem_ids)
+        fp.create_dataset("colors", data=colors)
+    
+    print(f"Successfully saved point cloud for {os.path.basename(glb_path)} with {len(vertices)} points")
 
 def get_scene_boundaries(inputs):
     scene_path, save_path = inputs
@@ -688,24 +883,46 @@ def convert_point_cloud_to_semantic_map(
 if __name__ == "__main__":
     scene_paths = sorted(
         glob.glob(
-            os.path.join(SCENES_ROOT, "**/*.glb"),
+            os.path.join(SCENES_ROOT, "**/*.basis.glb"),
             recursive=True,
         )
     )
-    # Select only scenes that have corresponding semantics
+    
+    # Debug prints
+    print(f"All scene paths found: {len(scene_paths)}")
+    for path in scene_paths[:5]:
+        print(f"  - {path}")
+    
+    # Check for corresponding semantic PLY files
     scene_paths = list(
         filter(
-            lambda x: os.path.isfile(x.replace(".glb", "_semantic.ply")), scene_paths
+            lambda x: os.path.isfile(x.replace(".basis.glb", ".semantic.glb")),
+            scene_paths
         )
     )
-
-    # Select only scenes from the train and val splits
-    valid_scenes = (
-        SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
-    )
+    
+    # Debug prints
+    print(f"Paths with semantic PLY files: {len(scene_paths)}")
+    for path in scene_paths[:5]:
+        print(f"  - {path}")
+    
+    # Get just the scene ID without numeric prefix
+    # For example, extract "kfPV7w3FaU5" from "00000-kfPV7w3FaU5"
+    valid_scenes = SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
+    
+    # Extract scene names correctly from paths like:
+    # /app/PONI/data/scene_datasets/hm3d_uncompressed/00000-kfPV7w3FaU5/kfPV7w3FaU5.basis.glb
     scene_paths = list(
-        filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes, scene_paths)
+        filter(
+            lambda x: os.path.basename(x).split(".")[0] in valid_scenes, 
+            scene_paths
+        )
     )
+    
+    # Debug prints
+    print(f"Valid scenes in split: {len(scene_paths)}")
+    for path in scene_paths[:5]:
+        print(f"  - {path}")
 
     print(f"Number of available scenes: {len(scene_paths)}")
 
@@ -724,10 +941,29 @@ if __name__ == "__main__":
     _ = list(tqdm.tqdm(pool.imap(get_scene_boundaries, inputs), total=len(inputs)))
 
     # Generate point-clouds for each scene
-    os.makedirs(PC_SAVE_ROOT, exist_ok=True)
-    print("===========> Extracting point-clouds")
-    inputs = []
-    for scene_path in scene_paths:
+# Generate point-clouds for each scene
+os.makedirs(PC_SAVE_ROOT, exist_ok=True)
+print("===========> Extracting point-clouds")
+inputs = []
+for scene_path in scene_paths:
+    if ACTIVE_DATASET == "hm3d":
+        semantic_glb_path = scene_path.replace(".basis.glb", ".semantic.glb")
+        semantic_txt_path = scene_path.replace(".basis.glb", ".semantic.txt")
+        scene_name = os.path.basename(os.path.dirname(scene_path))
+        scene_name = scene_name.split("-")[1]  # Extract the actual scene ID
+        pc_save_path = os.path.join(PC_SAVE_ROOT, f"{scene_name}.h5")
+        if not os.path.isfile(pc_save_path) and os.path.isfile(semantic_glb_path) and os.path.isfile(semantic_txt_path):
+            inputs.append(
+                (
+                    extract_hm3d_scene_point_clouds,
+                    scene_path,
+                    semantic_glb_path,
+                    semantic_txt_path,
+                    os.path.join(SB_SAVE_ROOT, f"{scene_name}.json"),
+                    pc_save_path,
+                )
+            )
+    else:
         ply_path = scene_path.replace(".glb", "_semantic.ply")
         scn_path = scene_path.replace(".glb", ".scn")
         scene_name = scene_path.split("/")[-1].split(".")[0]
