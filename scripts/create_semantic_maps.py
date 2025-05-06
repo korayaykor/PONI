@@ -223,9 +223,11 @@ def extract_scene_point_clouds(
         ocat = obj_id_to_cat[obj_id]
         sem_id = OBJECT_CATEGORY_MAP[ocat]
         color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        # Create trimesh vertices and faces from faces
-        faces = np.array(faces)  # (N, 3, 3)
-        t_pts = hab_utils.dense_sampling_trimesh(faces, sampling_density)
+        
+        # Sample more points for each object to ensure better representation
+        sampling_density_local = sampling_density * 2  # Increase sampling density for objects
+        t_pts = hab_utils.dense_sampling_trimesh(np.array(faces), sampling_density_local)
+        
         for t_pt in t_pts:
             vertices.append(t_pt)
             obj_ids.append(obj_id)
@@ -778,9 +780,13 @@ def convert_point_cloud_to_semantic_map(
             for obj_id in per_floor_obj_ids[floor_id]:
                 is_object = is_object | (all_obj_ids == obj_id)
 
-            mask = is_floor | is_wall | is_object
+            # Slightly elevate objects above floor to ensure they appear in projection
+            vertices_copy = np.copy(all_vertices)
+            obj_mask = is_object & ~is_floor & ~is_wall
+            vertices_copy[obj_mask, 1] += 0.1  # Add 10cm to object heights
 
-            vertices = np.copy(all_vertices[mask])
+            mask = is_floor | is_wall | is_object
+            vertices = vertices_copy[mask]
             obj_ids = np.copy(all_obj_ids[mask])
             sem_ids = np.copy(all_sem_ids[mask])
 
