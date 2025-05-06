@@ -1,7 +1,7 @@
 import numpy as np
 
 
-REGISTERED_DATASETS = ["gibson", "mp3d"]
+REGISTERED_DATASETS = ["gibson", "mp3d", "hm3d"]
 SPLIT_SCENES = {
     "gibson": {
         "train": [
@@ -112,6 +112,16 @@ SPLIT_SCENES = {
             "zsNo4HB9uLZ",
         ],
     },
+    "hm3d": {
+        "train": [
+            "ur6pFq6Qu1A",
+            "vyrNrziPKCB",
+        ],
+        "val": [
+            "x8F5xyUWy9e",
+            "zsNo4HB9uLZ",
+        ],
+    },
 }
 OBJECT_CATEGORIES = {
     "gibson": [
@@ -134,6 +144,31 @@ OBJECT_CATEGORIES = {
         "bottle",
     ],
     "mp3d": [
+        "floor",
+        "wall",
+        "chair",
+        "table",
+        "picture",
+        "cabinet",
+        "cushion",
+        "sofa",
+        "bed",
+        "chest_of_drawers",
+        "plant",
+        "sink",
+        "toilet",
+        "stool",
+        "towel",
+        "tv_monitor",
+        "shower",
+        "bathtub",
+        "counter",
+        "fireplace",
+        "gym_equipment",
+        "seating",
+        "clothes ",
+    ],
+    "hm3d": [
         "floor",
         "wall",
         "chair",
