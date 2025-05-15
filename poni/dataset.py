@@ -411,7 +411,7 @@ class SemanticMapDataset(Dataset):
         """
         in_semmap = asnumpy(in_semmap)
         semmap = asnumpy(semmap)
-        semmap_rgb = SemanticMapDataset.visualize_map(in_semmap, bg=1.0, dataset=dataset)
+        semmap_rgb = SemanticMapDataset.visualize_map(in_semmap, bg=1.0, dataset='hm3d')
         red_image = np.zeros_like(semmap_rgb)
         red_image[..., 0] = 255
         object_pfs = asnumpy(object_pfs)

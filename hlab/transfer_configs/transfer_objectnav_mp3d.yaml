@@ -23,6 +23,7 @@ EVAL:
 
 GLOBAL_AGENT:
   name: "SemExp"
+  dataset: "hm3d"
 
 SEM_EXP_POLICY:
   pretrained_weights: '../pretrained_models/sem_exp.pth'

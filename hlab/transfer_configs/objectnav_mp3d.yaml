@@ -6,7 +6,7 @@ SIMULATOR:
   TILT_ANGLE: 30
   ACTION_SPACE_CONFIG: "v1"
   AGENT_0:
-    SENSORS: ['RGB_SENSOR', 'DEPTH_SENSOR']
+    SENSORS: ['RGB_SENSOR', 'DEPTH_SENSOR', 'SEMANTIC_SENSOR']
     HEIGHT: 0.88
     RADIUS: 0.18
   HABITAT_SIM_V0:
@@ -47,5 +47,5 @@ TASK:
 DATASET:
   TYPE: ObjectNav-v1
   SPLIT: train
-  DATA_PATH: "../data/datasets/objectnav/mp3d/v1/{split}/{split}.json.gz"
-  SCENES_DIR: "../data/scene_datasets/"
+  DATA_PATH: "../data/objectnav_hm3d_v1/{split}/{split}.json.gz"
+  SCENES_DIR: "../data/scene_datasets/hm3d_uncompressed/"
