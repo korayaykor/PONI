@@ -72,7 +72,7 @@ _C.SEMANTIC_MAPPING.use_gt_segmentation = False
 # Global exploration agent
 ################################################################################
 _C.GLOBAL_AGENT = CN()
-_C.GLOBAL_AGENT.dataset = "mp3d"
+_C.GLOBAL_AGENT.dataset = "hm3d"
 _C.GLOBAL_AGENT.name = "SemExp"
 _C.GLOBAL_AGENT.map_size_cm = 4800
 _C.GLOBAL_AGENT.map_resolution = 5

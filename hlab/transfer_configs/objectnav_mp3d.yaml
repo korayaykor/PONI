@@ -47,5 +47,5 @@ TASK:
 DATASET:
   TYPE: ObjectNav-v1
   SPLIT: train
-  DATA_PATH: "../data/datasets/objectnav/mp3d/v1/{split}/{split}.json.gz"
-  SCENES_DIR: "../data/scene_datasets/"
+  DATA_PATH: "../data/datasets/objectnav_hm3d_v1/{split}/{split}.json.gz"
+  SCENES_DIR: "../data/scene_datasets/hm3d_uncompressed/"

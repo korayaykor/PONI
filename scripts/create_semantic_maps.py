@@ -5,80 +5,70 @@ import multiprocessing as mp
 import os
 import random
 import re
-
 from collections import defaultdict
+import csv
+import logging # Added for logging
 
 import cv2
 import h5py
 import numpy as np
-import torch
+# import torch # Not directly used in this script, but torch_scatter is
 import tqdm
 import trimesh
 from PIL import Image, ImageDraw, ImageFont
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max # type: ignore
 
 Image.MAX_IMAGE_PIXELS = 1000000000
 import poni.hab_utils as hab_utils
 from matplotlib import font_manager
 from plyfile import PlyData
 
-from poni.constants import d3_40_colors_rgb, OBJECT_CATEGORIES, SPLIT_SCENES
+# Assuming poni.constants has been updated for HM3D
+from poni.constants import (
+    d3_40_colors_rgb,
+    OBJECT_CATEGORIES,
+    OBJECT_CATEGORY_MAP,
+    SPLIT_SCENES,
+)
+
+# --- Setup Logging ---
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger(__name__)
 
 random.seed(123)
 
-################################################################################
-# Gibson constants
-################################################################################
-GIBSON_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["gibson"]
-GIBSON_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(GIBSON_CATEGORIES)}
-GIBSON_OBJECT_COLORS = [
-    (0.9400000000000001, 0.7818, 0.66),
-    (0.9400000000000001, 0.8868, 0.66),
-    (0.8882000000000001, 0.9400000000000001, 0.66),
-    (0.7832000000000001, 0.9400000000000001, 0.66),
-    (0.6782000000000001, 0.9400000000000001, 0.66),
-    (0.66, 0.9400000000000001, 0.7468000000000001),
-    (0.66, 0.9400000000000001, 0.8518000000000001),
-    (0.66, 0.9232, 0.9400000000000001),
-    (0.66, 0.8182, 0.9400000000000001),
-    (0.66, 0.7132, 0.9400000000000001),
-    (0.7117999999999999, 0.66, 0.9400000000000001),
-    (0.8168, 0.66, 0.9400000000000001),
-    (0.9218, 0.66, 0.9400000000000001),
-    (0.9400000000000001, 0.66, 0.8531999999999998),
-    (0.9400000000000001, 0.66, 0.748199999999999),
-]
-################################################################################
-# MP3D constants
-################################################################################
-MP3D_CATEGORIES = ["out-of-bounds"] + OBJECT_CATEGORIES["mp3d"]
-MP3D_CATEGORY_MAP = {obj: idx for idx, obj in enumerate(MP3D_CATEGORIES)}
-MP3D_OBJECT_COLORS = []  # Excludes 'out-of-bounds', 'floor', and 'wall'
-for color in d3_40_colors_rgb[: len(MP3D_CATEGORIES) - 3]:
-    color = (color.astype(np.float32) / 255.0).tolist()
-    MP3D_OBJECT_COLORS.append(color)
+# --- Dataset-specific configurations ---
+if "ACTIVE_DATASET" not in os.environ:
+    logger.error("CRITICAL: ACTIVE_DATASET environment variable is not set. Exiting.")
+    logger.error("Please set it, e.g., export ACTIVE_DATASET=hm3d")
+    exit(1)
+ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]
+logger.info(f"ACTIVE_DATASET set to: {ACTIVE_DATASET}")
 
-################################################################################
-# General constants
-################################################################################
-assert "ACTIVE_DATASET" in os.environ
-ACTIVE_DATASET = os.environ["ACTIVE_DATASET"]  # mp3d / gibson
-if ACTIVE_DATASET == "mp3d":
-    OBJECT_COLORS = MP3D_OBJECT_COLORS
-    OBJECT_CATEGORIES = MP3D_CATEGORIES
-    OBJECT_CATEGORY_MAP = MP3D_CATEGORY_MAP
-    SCENES_ROOT = "data/scene_datasets/mp3d_uncompressed"
-    SB_SAVE_ROOT = "data/semantic_maps/mp3d/scene_boundaries"
-    PC_SAVE_ROOT = "data/semantic_maps/mp3d/point_clouds"
-    SEM_SAVE_ROOT = "data/semantic_maps/mp3d/semantic_maps"
-    NUM_WORKERS = 8
-    MAX_TASKS_PER_CHILD = 2
-    SAMPLING_RESOLUTION = 0.20
-    WALL_THRESH = [0.25, 1.25]
-else:
-    OBJECT_COLORS = GIBSON_OBJECT_COLORS
-    OBJECT_CATEGORIES = GIBSON_CATEGORIES
-    OBJECT_CATEGORY_MAP = GIBSON_CATEGORY_MAP
+
+# Initialize current dataset variables
+CURRENT_OBJECT_CATEGORIES = OBJECT_CATEGORIES.get(ACTIVE_DATASET, [])
+CURRENT_OBJECT_CATEGORY_MAP = OBJECT_CATEGORY_MAP.get(ACTIVE_DATASET, {})
+CURRENT_OBJECT_COLORS_VIS = []
+
+if not CURRENT_OBJECT_CATEGORIES or not CURRENT_OBJECT_CATEGORY_MAP:
+    logger.error(f"CRITICAL: Categories for dataset '{ACTIVE_DATASET}' are not defined in poni/constants.py. Exiting.")
+    exit(1)
+
+
+if ACTIVE_DATASET == "gibson":
+    GIBSON_OBJECT_COLORS = [
+        (0.9400000000000001, 0.7818, 0.66), (0.9400000000000001, 0.8868, 0.66),
+        (0.8882000000000001, 0.9400000000000001, 0.66), (0.7832000000000001, 0.9400000000000001, 0.66),
+        (0.6782000000000001, 0.9400000000000001, 0.66), (0.66, 0.9400000000000001, 0.7468000000000001),
+        (0.66, 0.9400000000000001, 0.8518000000000001), (0.66, 0.9232, 0.9400000000000001),
+        (0.66, 0.8182, 0.9400000000000001), (0.66, 0.7132, 0.9400000000000001),
+        (0.7117999999999999, 0.66, 0.9400000000000001), (0.8168, 0.66, 0.9400000000000001),
+        (0.9218, 0.66, 0.9400000000000001), (0.9400000000000001, 0.66, 0.8531999999999998),
+        (0.9400000000000001, 0.66, 0.748199999999999),
+    ]
+    CURRENT_OBJECT_COLORS_VIS = GIBSON_OBJECT_COLORS
     SCENES_ROOT = "data/scene_datasets/gibson_semantic"
     SB_SAVE_ROOT = "data/semantic_maps/gibson/scene_boundaries"
     PC_SAVE_ROOT = "data/semantic_maps/gibson/point_clouds"
@@ -87,173 +77,697 @@ else:
     MAX_TASKS_PER_CHILD = None
     SAMPLING_RESOLUTION = 0.10
     WALL_THRESH = [0.25, 1.25]
+elif ACTIVE_DATASET == "mp3d":
+    MP3D_OBJECT_COLORS_TEMP = []
+    if len(CURRENT_OBJECT_CATEGORIES) > 2:
+        for color in d3_40_colors_rgb[: len(CURRENT_OBJECT_CATEGORIES) - 2]:
+            MP3D_OBJECT_COLORS_TEMP.append((color.astype(np.float32) / 255.0).tolist())
+    CURRENT_OBJECT_COLORS_VIS = MP3D_OBJECT_COLORS_TEMP
+    SCENES_ROOT = "data/scene_datasets/mp3d_uncompressed"
+    SB_SAVE_ROOT = "data/semantic_maps/mp3d/scene_boundaries"
+    PC_SAVE_ROOT = "data/semantic_maps/mp3d/point_clouds"
+    SEM_SAVE_ROOT = "data/semantic_maps/mp3d/semantic_maps"
+    NUM_WORKERS = 8
+    MAX_TASKS_PER_CHILD = 2
+    SAMPLING_RESOLUTION = 0.20
+    WALL_THRESH = [0.25, 1.25]
+elif ACTIVE_DATASET == "hm3d":
+    HM3D_OBJECT_COLORS_TEMP = []
+    if len(CURRENT_OBJECT_CATEGORIES) > 2:
+        for color in d3_40_colors_rgb[: len(CURRENT_OBJECT_CATEGORIES) - 2]:
+            HM3D_OBJECT_COLORS_TEMP.append((color.astype(np.float32) / 255.0).tolist())
+    CURRENT_OBJECT_COLORS_VIS = HM3D_OBJECT_COLORS_TEMP
+    SCENES_ROOT = "data/scene_datasets/hm3d_uncompressed/"
+    if not os.path.isdir(SCENES_ROOT):
+        logger.error(f"CRITICAL: HM3D SCENES_ROOT does not exist or is not a directory: {SCENES_ROOT}")
+        logger.error("Please ensure this path is correct relative to your PONI_ROOT.")
+        exit(1)
 
-COLOR_PALETTE = [
-    1.0,
-    1.0,
-    1.0,  # Out-of-bounds
-    0.9,
-    0.9,
-    0.9,  # Floor
-    0.3,
-    0.3,
-    0.3,  # Wall
-    *[oci for oc in OBJECT_COLORS for oci in oc],
+    SB_SAVE_ROOT = "data/semantic_maps/hm3d/scene_boundaries"
+    PC_SAVE_ROOT = "data/semantic_maps/hm3d/point_clouds"
+    SEM_SAVE_ROOT = "data/semantic_maps/hm3d/semantic_maps"
+    NUM_WORKERS = int(os.cpu_count() * 0.75) if os.cpu_count() and os.cpu_count() > 1 else 1
+    MAX_TASKS_PER_CHILD = None
+    SAMPLING_RESOLUTION = 0.10
+    WALL_THRESH = [0.25, 1.25]
+else:
+    logger.error(f"Unsupported ACTIVE_DATASET: {ACTIVE_DATASET}")
+    exit(1)
+
+logger.info(f"Using SCENES_ROOT: {SCENES_ROOT}")
+logger.info(f"Outputting scene boundaries to: {SB_SAVE_ROOT}")
+logger.info(f"Outputting point clouds to: {PC_SAVE_ROOT}")
+logger.info(f"Outputting semantic maps to: {SEM_SAVE_ROOT}")
+
+
+COLOR_PALETTE_VIS = [
+    1.0, 1.0, 1.0,
+    0.9, 0.9, 0.9,
+    0.3, 0.3, 0.3,
+    *[oci for oc in CURRENT_OBJECT_COLORS_VIS for oci in oc],
 ]
-LEGEND_PALETTE = [
-    (1.0, 1.0, 1.0),  # Out-of-bounds
-    (0.9, 0.9, 0.9),  # Floor
-    (0.3, 0.3, 0.3),  # Wall
-    *OBJECT_COLORS,
+LEGEND_PALETTE_VIS = [
+    (1.0, 1.0, 1.0), (0.9, 0.9, 0.9), (0.3, 0.3, 0.3),
+    *CURRENT_OBJECT_COLORS_VIS,
 ]
+
+HM3D_RAW_TO_PONI_CATEGORY_MAP = {
+    "floor": "floor", "wall": "wall", "ceiling": "ceiling", "chair": "chair",
+    "table": "table", "desk": "table", "door": "door", "window": "window",
+    "window frame": "window", "door frame": "door", "sofa": "sofa", "couch": "sofa",
+    "bed": "bed", "sink": "sink", "toilet": "toilet", "tv": "tv_monitor",
+    "tv_monitor": "tv_monitor", "cabinet": "cabinet", "shelf": "shelving",
+    "shelves": "shelving", "plant": "plant", "potted plant": "plant",
+    "potted_plant": "plant", "picture": "picture", "painting": "picture",
+    "mirror": "mirror", "lighting": "lighting", "lamp": "lighting",
+    "ceiling lamp": "lighting", "wall lamp": "lighting", "appliance": "appliances",
+    "refrigerator": "appliances", "oven": "appliances", "stove": "appliances",
+    "microwave": "appliances", "dishwasher": "appliances",
+    "kitchen appliance": "appliances", "heater": "appliances",
+    "objects": "objects", "decoration": "objects", "cushion": "cushion",
+    "pillow": "cushion", "towel": "towel", "chest_of_drawers": "chest_of_drawers",
+    "stool": "stool", "bathtub": "bathtub", "shower": "shower",
+    "shower cabin": "shower", "counter": "counter", "kitchen counter": "counter",
+    "countertop": "counter", "fireplace": "fireplace",
+    "gym_equipment": "gym_equipment", "seating": "seating", "clothes": "clothes",
+    "book": "book", "books": "book", "rug": "rug", "box": "objects",
+    "curtain": "curtain", "blinds": "blinds", "vent": "vent", "fire alarm": "fire alarm",
+    "sculpture": "objects", "drawer": "objects",
+    "sheet": "objects",
+    "balustrade": "railing",
+    "railing": "railing",
+    "stairs": "stairs",
+    "beam": "beam",
+    "wall panel": "wall",
+    "toilet paper": "objects",
+    "tap": "objects",
+    "step": "stairs",
+    "display cabinet": "cabinet",
+    "bottles of wine": "objects",
+    "kitchen cabinet": "cabinet",
+    "paper towel": "objects",
+    "kitchen extractor": "appliances",
+    "mini fridge": "appliances",
+    "kitchen countertop item": "objects",
+    "kettle": "appliances",
+    "coffee machine": "appliances",
+    "dishrag": "objects",
+    "alarm": "objects",
+    "dining table": "table",
+    "dining chair": "chair",
+    "air conditioner": "appliances",
+    "duct": "objects",
+    "unknown": "objects",
+}
+if ACTIVE_DATASET == "hm3d" and len(HM3D_RAW_TO_PONI_CATEGORY_MAP) < 10:
+    logger.warning("HM3D_RAW_TO_PONI_CATEGORY_MAP seems sparsely populated. Please ensure it's comprehensive.")
+
+def map_hm3d_raw_label_to_poni_category(raw_label):
+    cleaned_label = raw_label.lower().strip().replace('_', ' ').replace('-', ' ')
+    return HM3D_RAW_TO_PONI_CATEGORY_MAP.get(cleaned_label, None)
 
 
 def get_palette_image():
-    # Find a font file
     mpl_font = font_manager.FontProperties(family="sans-serif", weight="bold")
     file = font_manager.findfont(mpl_font)
     font = ImageFont.truetype(font=file, size=20)
-
-    # Save color palette
     cat_size = 30
     buf_size = 10
-    text_width = 150
+    text_width = 170
 
-    image = np.zeros(
-        (cat_size * len(OBJECT_CATEGORIES), cat_size + buf_size + text_width, 3),
-        dtype=np.uint8,
+    num_display_categories = min(len(CURRENT_OBJECT_CATEGORIES), len(LEGEND_PALETTE_VIS))
+    if num_display_categories == 0:
+        logger.warning("No categories or legend palette to display in get_palette_image.")
+        return np.zeros((100,100,3), dtype=np.uint8)
+
+    image_pil = Image.new(
+        "RGB",
+        (cat_size + buf_size + text_width, cat_size * num_display_categories),
+        (255,255,255)
     )
-    image = Image.fromarray(image)
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(image_pil)
 
-    for i, (category, color) in enumerate(zip(OBJECT_CATEGORIES, LEGEND_PALETTE)):
-        color = tuple([int(c * 255) for c in color])
+    for i in range(num_display_categories):
+        category = CURRENT_OBJECT_CATEGORIES[i]
+        color_tuple = LEGEND_PALETTE_VIS[i]
+        color_int = tuple([int(c * 255) for c in color_tuple])
         draw.rectangle(
             [(0, i * cat_size), (cat_size, (i + 1) * cat_size)],
-            fill=color,
-            outline=(0, 0, 0),
-            width=2,
+            fill=color_int, outline=(0, 0, 0), width=1,
         )
-        draw.text(
-            [cat_size + buf_size, i * cat_size],
-            category,
-            font=font,
-            fill=(255, 255, 255),
-        )
-
-    return np.array(image)
+        text_color = (0,0,0) if sum(color_int) > (255*3/2) else (255,255,255)
+        try:
+            text_bbox = font.getbbox(category)
+            text_h = text_bbox[3] - text_bbox[1]
+            text_y_pos = i * cat_size + (cat_size - text_h) // 2
+            draw.text( (cat_size + buf_size, text_y_pos), category, font=font, fill=text_color,)
+        except AttributeError:
+             draw.text( (cat_size + buf_size, i * cat_size + 5), category, font=font, fill=text_color,)
+    return np.array(image_pil)
 
 
 def extract_scene_point_clouds(
     glb_path,
-    ply_path,
-    scn_path,
+    semantic_file_path_or_info,
     houses_dim_path,
     pc_save_path,
     sampling_density=1600.0,
 ):
-    print(f"Scene: {glb_path}")
-    # Get mapping from object instance id to category
-    if os.path.isfile(scn_path):
-        with open(scn_path) as fp:
-            scn_data = json.load(fp)
-        obj_id_to_cat = {
-            obj["id"]: obj["class_"]
-            for obj in scn_data["objects"]
-            if obj["class_"] in OBJECT_CATEGORY_MAP
-        }
-    else:
-        sim = hab_utils.robust_load_sim(glb_path)
-        objects = sim.semantic_scene.objects
-        obj_id_to_cat = {}
-        for obj in objects:
-            obj_id = obj.id.split("_")[-1]  # <level_id>_<region_id>_<object_id>
-            obj_cat = obj.category.name()
-            if obj_cat not in OBJECT_CATEGORY_MAP or obj_cat in ["wall", "floor"]:
-                continue
-            obj_id_to_cat[int(obj_id)] = obj_cat
-        sim.close()
-    ############################################################################
-    # Get vertices for all objects
-    ############################################################################
+    logger.info(f"Processing scene for point clouds: {os.path.basename(glb_path)}")
+    obj_id_to_cat = {}
+
+    if ACTIVE_DATASET == "hm3d":
+        if not semantic_file_path_or_info or not os.path.isfile(semantic_file_path_or_info):
+            logger.error(f"HM3D semantic.txt file not found: {semantic_file_path_or_info} for scene {glb_path}")
+            return
+        try:
+            with open(semantic_file_path_or_info, 'r') as f:
+                first_line = f.readline().strip()
+                is_header = "HM3D Semantic Annotations" in first_line or \
+                            (',' in first_line and ("instance_id" in first_line.lower() or "object_id" in first_line.lower()))
+                if not is_header:
+                    f.seek(0)
+
+                reader = csv.reader(f)
+                if is_header and "HM3D Semantic Annotations" not in first_line :
+                    try:
+                        next(reader)
+                    except StopIteration:
+                        logger.warning(f"Empty semantic file after header: {semantic_file_path_or_info}")
+                        return
+
+                for row_idx, row in enumerate(reader):
+                    if not row or len(row) < 3:
+                        continue
+                    instance_id_str, _, raw_category_label = row[0].strip(), row[1], row[2].strip().strip('"')
+                    poni_category_name = map_hm3d_raw_label_to_poni_category(raw_category_label)
+                    if poni_category_name and \
+                       poni_category_name in CURRENT_OBJECT_CATEGORY_MAP and \
+                       poni_category_name not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                        try:
+                            instance_id = int(instance_id_str)
+                            obj_id_to_cat[instance_id] = poni_category_name
+                        except ValueError:
+                            logger.warning(f"Could not parse instance_id '{instance_id_str}' as int in {os.path.basename(semantic_file_path_or_info)} at row {row_idx+1}")
+        except Exception as e:
+            logger.error(f"Error parsing HM3D semantic.txt file {os.path.basename(semantic_file_path_or_info)}: {e}", exc_info=True)
+            return
+        logger.info(f"HM3D: Loaded {len(obj_id_to_cat)} object instance mappings from {os.path.basename(semantic_file_path_or_info)}.")
+    elif ACTIVE_DATASET == "gibson":
+        ply_path_gibson = semantic_file_path_or_info
+        if os.path.isfile(ply_path_gibson):
+            try:
+                sim = hab_utils.robust_load_sim(glb_path)
+                if sim.semantic_scene and sim.semantic_scene.objects:
+                    for obj in sim.semantic_scene.objects:
+                        try: obj_instance_id = int(obj.id.split('_')[-1])
+                        except: continue
+                        raw_cat_name = obj.category.name()
+                        if raw_cat_name in CURRENT_OBJECT_CATEGORY_MAP and \
+                           raw_cat_name not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                            obj_id_to_cat[obj_instance_id] = raw_cat_name
+                sim.close()
+            except Exception as e:
+                logger.error(f"Error using sim for Gibson semantics {glb_path}: {e}", exc_info=True)
+        else:
+            logger.warning(f"Gibson semantic PLY file not found: {ply_path_gibson}")
+    elif ACTIVE_DATASET == "mp3d":
+        scn_path = semantic_file_path_or_info
+        if os.path.isfile(scn_path):
+            with open(scn_path) as fp: scn_data = json.load(fp)
+            for obj in scn_data["objects"]:
+                if obj["class_"] in CURRENT_OBJECT_CATEGORY_MAP and \
+                   obj["class_"] not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                    obj_id_to_cat[obj["id"]] = obj["class_"]
+        else:
+            logger.warning(f"MP3D .scn file not found: {scn_path}. Consider sim fallback if needed.")
+
+
     vertices = []
     colors = []
-    obj_ids = []
-    sem_ids = []
-    ply_data = PlyData.read(ply_path)
-    # Get faces for each object id
-    obj_id_to_faces = defaultdict(list)
-    for face in ply_data["face"]:
-        vids = list(face[0])
-        obj_id = face[1]
-        if obj_id in obj_id_to_cat:
-            p1 = ply_data["vertex"][vids[0]]
-            p1 = [p1[0], p1[2], -p1[1]]
-            p2 = ply_data["vertex"][vids[1]]
-            p2 = [p2[0], p2[2], -p2[1]]
-            p3 = ply_data["vertex"][vids[2]]
-            p3 = [p3[0], p3[2], -p3[1]]
-            obj_id_to_faces[obj_id].append([p1, p2, p3])
-    # Get dense point-clouds for each object id
-    for obj_id, faces in obj_id_to_faces.items():
-        ocat = obj_id_to_cat[obj_id]
-        sem_id = OBJECT_CATEGORY_MAP[ocat]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        # Create trimesh vertices and faces from faces
-        faces = np.array(faces)  # (N, 3, 3)
-        t_pts = hab_utils.dense_sampling_trimesh(faces, sampling_density)
-        for t_pt in t_pts:
-            vertices.append(t_pt)
-            obj_ids.append(obj_id)
-            sem_ids.append(sem_id)
-            colors.append(color)
+    obj_ids_out = []
+    sem_ids_out = []
 
-    ############################################################################
-    # Get vertices for navigable spaces
-    ############################################################################
-    sim = hab_utils.robust_load_sim(glb_path)
-    navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
-    t_pts = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
-    for t_pt in t_pts:
-        obj_id = -1
-        sem_id = OBJECT_CATEGORY_MAP["floor"]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        vertices.append(t_pt)
-        obj_ids.append(obj_id)
-        sem_ids.append(sem_id)
-        colors.append(color)
-    sim.close()
+    if ACTIVE_DATASET == "hm3d":
+        logger.debug(f"HM3D: Extracting object meshes from GLB: {os.path.basename(glb_path)}")
+        try:
+            scene_trimesh_obj = trimesh.load(glb_path, force='scene', process=False)
+            if not isinstance(scene_trimesh_obj, trimesh.Scene) or not hasattr(scene_trimesh_obj, 'graph'):
+                logger.error(f"Could not load {os.path.basename(glb_path)} as a trimesh.Scene with a graph. Loaded as {type(scene_trimesh_obj)}. Cannot extract instances by node name.")
+                scene_trimesh_obj = None
 
-    ############################################################################
-    # Get vertices for walls
-    ############################################################################
-    per_floor_wall_pc = extract_wall_point_clouds(
-        glb_path, houses_dim_path, sampling_density=sampling_density
-    )
-    for _, points in per_floor_wall_pc.items():
-        obj_id = -1
-        sem_id = OBJECT_CATEGORY_MAP["wall"]
-        color = COLOR_PALETTE[sem_id * 3 : (sem_id + 1) * 3]
-        for p in points:
-            vertices.append(p)
-            obj_ids.append(obj_id)
-            sem_ids.append(sem_id)
-            colors.append(color)
+            if scene_trimesh_obj:
+                for node_name in scene_trimesh_obj.graph.nodes_geometry:
+                    transform, geometry_name = scene_trimesh_obj.graph[node_name]
+                    
+                    parsed_instance_id = -1
+                    if node_name.isdigit(): 
+                        parsed_instance_id = int(node_name)
+                    else: 
+                        patterns = [r'object_(\d+)', r'mesh_(\d+)', r'^(\d+)[-_a-zA-Z]*', r'[._-](\d+)$', r'instance_(\d+)']
+                        for pat in patterns:
+                            match = re.search(pat, node_name, re.IGNORECASE) 
+                            if match:
+                                try:
+                                    parsed_instance_id = int(match.groups()[-1])
+                                    break
+                                except (ValueError, IndexError): continue
+                    
+                    if parsed_instance_id != -1 and parsed_instance_id in obj_id_to_cat:
+                        poni_category_name = obj_id_to_cat[parsed_instance_id]
+                        sem_id = CURRENT_OBJECT_CATEGORY_MAP[poni_category_name]
+                        mesh_instance = scene_trimesh_obj.geometry[geometry_name]
 
-    vertices = np.array(vertices)
-    obj_ids = np.array(obj_ids)
-    sem_ids = np.array(sem_ids)
-    colors = np.array(colors)
+                        if not isinstance(mesh_instance, trimesh.Trimesh) or not mesh_instance.vertices.shape[0] > 0:
+                            continue
+                        
+                        mesh_instance_transformed = mesh_instance.copy()
+                        mesh_instance_transformed.apply_transform(transform)
+                        
+                        if not hasattr(mesh_instance_transformed, 'triangles') or len(mesh_instance_transformed.triangles) == 0:
+                            continue
 
-    with h5py.File(pc_save_path, "w") as fp:
-        fp.create_dataset("vertices", data=vertices)
-        fp.create_dataset("obj_ids", data=obj_ids)
-        fp.create_dataset("sem_ids", data=sem_ids)
-        fp.create_dataset("colors", data=colors)
+                        t_pts = hab_utils.dense_sampling_trimesh(mesh_instance_transformed.triangles, sampling_density)
+                        
+                        obj_color_index = sem_id - 2 
+                        color_for_obj = (0.5, 0.5, 0.5)
+                        if obj_color_index >= 0 and obj_color_index < len(CURRENT_OBJECT_COLORS_VIS):
+                            color_for_obj = CURRENT_OBJECT_COLORS_VIS[obj_color_index]
+                        elif sem_id < len(LEGEND_PALETTE_VIS):
+                             color_for_obj = LEGEND_PALETTE_VIS[sem_id]
+
+                        for t_pt in t_pts:
+                            vertices.append(t_pt); obj_ids_out.append(parsed_instance_id); sem_ids_out.append(sem_id); colors.append(list(color_for_obj))
+        except Exception as e:
+            logger.error(f"Error loading/processing HM3D GLB {os.path.basename(glb_path)} for object extraction: {e}", exc_info=True)
+    # ... (Keep Gibson/MP3D object extraction)
+
+    logger.info(f"Collected {len(vertices)} object vertices for {os.path.basename(glb_path)}.")
+
+    try:
+        # For HM3D, the scene_dataset_config might be needed by robust_load_sim
+        hm3d_scene_dataset_config = None
+        if ACTIVE_DATASET == "hm3d":
+            # Path relative to SCENES_ROOT (e.g. data/objectnav_hm3d_v1/scene_datasets/hm3d_uncompressed/)
+            # The config is likely one level up, in data/objectnav_hm3d_v1/scene_datasets/
+            potential_cfg_path = os.path.abspath(os.path.join(SCENES_ROOT, "..", "hm3d.scene_dataset_config.json"))
+            if os.path.isfile(potential_cfg_path):
+                hm3d_scene_dataset_config = potential_cfg_path
+                logger.info(f"Using HM3D scene dataset config: {hm3d_scene_dataset_config}")
+            else:
+                logger.warning(f"HM3D scene_dataset_config.json not found at expected path: {potential_cfg_path}. Sim might not load all assets correctly.")
 
 
-def _aux_fn(inputs):
-    return inputs[0](*inputs[1:])
+        sim = hab_utils.robust_load_sim(glb_path, scene_dataset_config_file=hm3d_scene_dataset_config)
+        navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
+        if navmesh_triangles.size > 0:
+            t_pts_nav = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
+            nav_sem_id = CURRENT_OBJECT_CATEGORY_MAP.get("floor", 0)
+            nav_color_tuple = LEGEND_PALETTE_VIS[nav_sem_id] if nav_sem_id < len(LEGEND_PALETTE_VIS) else LEGEND_PALETTE_VIS[0]
+            nav_color = [float(c) for c in nav_color_tuple]
+            for t_pt in t_pts_nav:
+                vertices.append(t_pt); obj_ids_out.append(-1); sem_ids_out.append(nav_sem_id); colors.append(nav_color)
+            logger.debug(f"Collected {len(t_pts_nav)} navmesh vertices.")
+        else:
+            logger.warning(f"No navmesh vertices found for {os.path.basename(glb_path)}.")
+        sim.close()
+    except Exception as e:
+        logger.error(f"Error processing navmesh for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+    try:
+        per_floor_wall_pc = extract_wall_point_clouds(
+            glb_path, houses_dim_path, sampling_density=sampling_density,
+            current_wall_thresh=WALL_THRESH
+        )
+        wall_sem_id = CURRENT_OBJECT_CATEGORY_MAP.get("wall", 1)
+        wall_color_tuple = LEGEND_PALETTE_VIS[wall_sem_id] if wall_sem_id < len(LEGEND_PALETTE_VIS) else LEGEND_PALETTE_VIS[0]
+        wall_color = [float(c) for c in wall_color_tuple]
+        num_wall_pts = 0
+        for _, points_on_floor in per_floor_wall_pc.items():
+            if points_on_floor.shape[0] > 0:
+                num_wall_pts += len(points_on_floor)
+                for p_wall in points_on_floor:
+                    vertices.append(p_wall); obj_ids_out.append(-1); sem_ids_out.append(wall_sem_id); colors.append(wall_color)
+        logger.debug(f"Collected {num_wall_pts} wall vertices.")
+    except Exception as e:
+        logger.error(f"Error processing walls for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+    if not vertices:
+        logger.warning(f"No vertices extracted at all for scene {os.path.basename(glb_path)}. Skipping save of H5 point cloud.")
+        return
+
+    vertices_arr = np.array(vertices)
+    obj_ids_arr = np.array(obj_ids_out)
+    sem_ids_arr = np.array(sem_ids_out)
+    colors_arr = np.array(colors)
+
+    try:
+        with h5py.File(pc_save_path, "w") as fp:
+            fp.create_dataset("vertices", data=vertices_arr)
+            fp.create_dataset("obj_ids", data=obj_ids_arr)
+            fp.create_dataset("sem_ids", data=sem_ids_arr)
+            fp.create_dataset("colors", data=colors_arr)
+        logger.info(f"Saved point cloud for {os.path.basename(glb_path)} to {pc_save_path} with {len(vertices_arr)} points.")
+    except Exception as e:
+        logger.error(f"Failed to save HDF5 point cloud for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+
+def get_scene_boundaries(inputs_tuple): # Modified to accept a tuple
+    scene_path, save_path = inputs_tuple
+    sim = None # Initialize sim to None for finally block
+    try:
+        logger.info(f"get_scene_boundaries: Starting for {os.path.basename(scene_path)}")
+        
+        scene_dataset_config = None
+        if ACTIVE_DATASET == "hm3d":
+            # SCENES_ROOT is like ".../hm3d_uncompressed/"
+            # Config is often one level up, e.g., ".../scene_datasets/hm3d.scene_dataset_config.json"
+            # Or sometimes named like "hm3d_annotated_basis.scene_dataset_config.json"
+            # It's better if this path can be made more explicit or passed if needed.
+            # For now, let's try a common pattern for Habitat datasets.
+            # The dir containing SCENES_ROOT (e.g., .../scene_datasets/)
+            scenes_root_parent_dir = os.path.abspath(os.path.join(SCENES_ROOT, ".."))
+            
+            potential_config_names = [
+                "hm3d.scene_dataset_config.json",
+                "hm3d_annotated_basis.scene_dataset_config.json", # From Adsız.jpg
+                "hm3d_semantic.scene_dataset_config.json"
+            ]
+            for cfg_name in potential_config_names:
+                potential_cfg_path = os.path.join(scenes_root_parent_dir, cfg_name)
+                if os.path.isfile(potential_cfg_path):
+                    scene_dataset_config = potential_cfg_path
+                    logger.info(f"Found HM3D scene dataset config: {scene_dataset_config}")
+                    break
+            if not scene_dataset_config:
+                 logger.warning(f"HM3D scene_dataset_config.json not found in {scenes_root_parent_dir} with common names. Sim might use defaults or fail for complex scenes.")
+
+
+        sim = hab_utils.robust_load_sim(scene_path, scene_dataset_config_file=scene_dataset_config)
+        if sim is None: # robust_load_sim might raise an error or return None if it handles internally
+            logger.error(f"Simulator could not be initialized for {os.path.basename(scene_path)}. Cannot get boundaries.")
+            return # Exit this task
+
+        floor_exts = hab_utils.get_floor_heights(sim, sampling_resolution=SAMPLING_RESOLUTION)
+        
+        # Get scene_name from scene_path (e.g., "00000-kfPV7w3FaU5" from ".../00000-kfPV7w3FaU5.semantic.glb")
+        # This should match the folder name if files are named like <folder>/<folder_short_id>.<type>.glb
+        scene_name_for_json = os.path.basename(os.path.dirname(scene_path))
+
+
+        scene_boundaries_data = {}
+        overall_bounds = sim.pathfinder.get_bounds()
+        if overall_bounds[0] is not None and overall_bounds[1] is not None:
+            scene_boundaries_data[scene_name_for_json] = hab_utils.convert_lu_bound_to_smnet_bound(overall_bounds) # Assuming this helper is in hab_utils
+        else:
+            logger.warning(f"Could not get overall bounds for {scene_name_for_json}")
+
+        for fidx, fext in enumerate(floor_exts):
+            y_min_for_floor = fext["min"] - 0.2
+            y_max_for_floor = fext["max"] + 0.2
+            bounds = hab_utils.get_navmesh_extents_at_y(sim, y_bounds=(y_min_for_floor, y_max_for_floor))
+            if bounds[0] is not None and bounds[1] is not None:
+                scene_boundaries_data[f"{scene_name_for_json}_{fidx}"] = hab_utils.convert_lu_bound_to_smnet_bound(bounds)
+            else:
+                logger.warning(f"Could not get bounds for floor {fidx} of {scene_name_for_json}")
+        
+        with open(save_path, "w") as fp:
+            json.dump(scene_boundaries_data, fp, indent=4)
+        logger.info(f"Saved scene boundaries for {scene_name_for_json} to {save_path}")
+
+    except Exception as e:
+        logger.error(f"!!! ERROR in get_scene_boundaries for {os.path.basename(scene_path)}: {e}", exc_info=True)
+    finally:
+        if sim is not None:
+            sim.close()
+            logger.debug(f"Simulator closed for {os.path.basename(scene_path)}")
+
+
+def extract_scene_point_clouds(
+    glb_path,
+    semantic_file_path_or_info,
+    houses_dim_path,
+    pc_save_path,
+    sampling_density=1600.0,
+):
+    # Re-check ACTIVE_DATASET from environment within the function, especially if called by a worker
+    worker_active_dataset = os.environ.get("ACTIVE_DATASET")
+    if not worker_active_dataset:
+        logger.error("Worker: ACTIVE_DATASET env variable not found inside extract_scene_point_clouds.")
+        # Fallback to module level if absolutely necessary, but this indicates an issue
+        worker_active_dataset = MODULE_LEVEL_ACTIVE_DATASET
+        logger.warning(f"Worker: Falling back to module-level ACTIVE_DATASET: {worker_active_dataset}")
+    
+    logger.info(f"Worker for {os.path.basename(glb_path)}: ACTIVE_DATASET is '{worker_active_dataset}'. Semantic file: {semantic_file_path_or_info}")
+
+
+    obj_id_to_cat = {}
+
+    if worker_active_dataset == "hm3d":
+        if not semantic_file_path_or_info or not os.path.isfile(semantic_file_path_or_info):
+            logger.error(f"HM3D semantic.txt file not found: {semantic_file_path_or_info} for scene {glb_path}")
+            return
+        try:
+            with open(semantic_file_path_or_info, 'r') as f:
+                first_line = f.readline().strip()
+                is_header = "HM3D Semantic Annotations" in first_line or \
+                            (',' in first_line and ("instance_id" in first_line.lower() or "object_id" in first_line.lower()))
+                if not is_header:
+                    f.seek(0)
+
+                reader = csv.reader(f)
+                if is_header and "HM3D Semantic Annotations" not in first_line :
+                    try:
+                        next(reader)
+                    except StopIteration:
+                        logger.warning(f"Empty semantic file after header: {semantic_file_path_or_info}")
+                        return
+
+                for row_idx, row in enumerate(reader):
+                    if not row or len(row) < 3:
+                        continue
+                    instance_id_str, _, raw_category_label = row[0].strip(), row[1], row[2].strip().strip('"')
+                    poni_category_name = map_hm3d_raw_label_to_poni_category(raw_category_label)
+                    if poni_category_name and \
+                       poni_category_name in CURRENT_OBJECT_CATEGORY_MAP and \
+                       poni_category_name not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                        try:
+                            instance_id = int(instance_id_str)
+                            obj_id_to_cat[instance_id] = poni_category_name
+                        except ValueError:
+                            logger.warning(f"Could not parse instance_id '{instance_id_str}' as int in {os.path.basename(semantic_file_path_or_info)} at row {row_idx+1}")
+        except Exception as e:
+            logger.error(f"Error parsing HM3D semantic.txt file {os.path.basename(semantic_file_path_or_info)}: {e}", exc_info=True)
+            return
+        logger.info(f"HM3D: Loaded {len(obj_id_to_cat)} object instance mappings from {os.path.basename(semantic_file_path_or_info)}.")
+    
+    elif worker_active_dataset == "gibson":
+        logger.info(f"Gibson: Attempting to load semantic info for {os.path.basename(glb_path)}")
+        sim_gibson = None
+        try:
+            # For Gibson, semantic_file_path_or_info is the _semantic.ply, but sim is often preferred for instance info
+            # If robust_load_sim needs the ply, it should be passed as scene_dataset_config or handled internally
+            sim_gibson = hab_utils.robust_load_sim(glb_path, scene_dataset_config_file=None) # Try without specific dataset config first for Gibson
+            if sim_gibson is not None:
+                logger.debug(f"Gibson: Simulator loaded for {os.path.basename(glb_path)}. Type of sim.semantic_scene: {type(sim_gibson.semantic_scene)}")
+                if sim_gibson.semantic_scene is not None:
+                    if not hasattr(sim_gibson.semantic_scene, 'objects') or sim_gibson.semantic_scene.objects is None:
+                        logger.warning(f"Gibson: sim.semantic_scene for {os.path.basename(glb_path)} has no 'objects' or it's None.")
+                    else:
+                        try:
+                            scene_objects = sim_gibson.semantic_scene.objects
+                            logger.debug(f"Gibson: Found {len(scene_objects)} potential objects in sim.semantic_scene for {os.path.basename(glb_path)}.")
+                            for obj_idx, obj in enumerate(scene_objects):
+                                if obj is None or obj.category is None: continue
+                                obj_instance_id_str = obj.id.split('_')[-1] if '_' in obj.id else obj.id
+                                try:
+                                    obj_instance_id = int(obj_instance_id_str)
+                                except ValueError: continue
+                                raw_cat_name = obj.category.name()
+                                poni_category_name = raw_cat_name
+                                if poni_category_name in CURRENT_OBJECT_CATEGORY_MAP and \
+                                   poni_category_name not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                                    obj_id_to_cat[obj_instance_id] = poni_category_name
+                        except Exception as ex_obj: # Catch specific errors like KeyError or AttributeError
+                            logger.error(f"Gibson: Error accessing sim.semantic_scene.objects for {os.path.basename(glb_path)}: {ex_obj}. Type: {type(sim_gibson.semantic_scene)}", exc_info=True)
+                else:
+                    logger.warning(f"Gibson: sim.semantic_scene is None for {os.path.basename(glb_path)}.")
+            else:
+                logger.warning(f"Gibson: robust_load_sim returned None for {os.path.basename(glb_path)}.")
+            
+            # Fallback to PLY parsing if sim didn't yield objects or failed
+            if not obj_id_to_cat and semantic_file_path_or_info and os.path.isfile(semantic_file_path_or_info):
+                logger.info(f"Gibson: No objects from sim, trying to parse _semantic.ply: {semantic_file_path_or_info}")
+                # ... (original PLY parsing logic for Gibson with error handling) ...
+        except Exception as e:
+            logger.error(f"Error processing Gibson scene {os.path.basename(glb_path)}: {e}", exc_info=True)
+        finally:
+            if sim_gibson is not None:
+                sim_gibson.close()
+        logger.info(f"Gibson: Loaded {len(obj_id_to_cat)} object instance mappings for {os.path.basename(glb_path)}.")
+
+    elif worker_active_dataset == "mp3d":
+        scn_path = semantic_file_path_or_info
+        if os.path.isfile(scn_path):
+            try:
+                with open(scn_path) as fp: scn_data = json.load(fp)
+                # Check if "objects" key exists before iterating
+                if "objects" in scn_data and isinstance(scn_data["objects"], list):
+                    for obj in scn_data["objects"]:
+                        if obj.get("class_") in CURRENT_OBJECT_CATEGORY_MAP and \
+                           obj["class_"] not in ["floor", "wall", "out-of-bounds", "ceiling"]:
+                            obj_id_to_cat[obj["id"]] = obj["class_"]
+                else:
+                    logger.warning(f"MP3D .scn file {scn_path} does not contain an 'objects' list key.")
+            except json.JSONDecodeError:
+                logger.error(f"MP3D: Failed to decode JSON from .scn file: {scn_path}", exc_info=True)
+            except Exception as e_scn:
+                logger.error(f"MP3D: Error processing .scn file {scn_path}: {e_scn}", exc_info=True)
+        else:
+            logger.warning(f"MP3D .scn file not found: {scn_path}. Consider sim fallback if needed.")
+        logger.info(f"MP3D: Loaded {len(obj_id_to_cat)} object instance mappings from {os.path.basename(scn_path if scn_path else 'N/A')}.")
+
+
+    vertices = []
+    colors = []
+    obj_ids_out = []
+    sem_ids_out = []
+
+    if worker_active_dataset == "hm3d":
+        logger.debug(f"HM3D: Extracting object meshes from GLB: {os.path.basename(glb_path)}")
+        try:
+            scene_trimesh_obj = trimesh.load(glb_path, force='scene', process=False)
+            if not isinstance(scene_trimesh_obj, trimesh.Scene) or not hasattr(scene_trimesh_obj, 'graph'):
+                logger.error(f"Could not load {os.path.basename(glb_path)} as a trimesh.Scene with a graph. Loaded as {type(scene_trimesh_obj)}. Cannot extract instances by node name.")
+                scene_trimesh_obj = None
+
+            if scene_trimesh_obj:
+                for node_name in scene_trimesh_obj.graph.nodes_geometry:
+                    transform, geometry_name = scene_trimesh_obj.graph[node_name]
+                    
+                    parsed_instance_id = -1
+                    if node_name.isdigit(): 
+                        parsed_instance_id = int(node_name)
+                    else: 
+                        patterns = [r'object_(\d+)', r'mesh_(\d+)', r'^(\d+)[-_a-zA-Z]*', r'[._-](\d+)$', r'instance_(\d+)']
+                        for pat in patterns:
+                            match = re.search(pat, node_name, re.IGNORECASE) 
+                            if match:
+                                try:
+                                    parsed_instance_id = int(match.groups()[-1])
+                                    break
+                                except (ValueError, IndexError): continue
+                    
+                    if parsed_instance_id != -1 and parsed_instance_id in obj_id_to_cat:
+                        poni_category_name = obj_id_to_cat[parsed_instance_id]
+                        sem_id = CURRENT_OBJECT_CATEGORY_MAP[poni_category_name]
+                        mesh_instance = scene_trimesh_obj.geometry[geometry_name]
+
+                        if not isinstance(mesh_instance, trimesh.Trimesh) or not mesh_instance.vertices.shape[0] > 0:
+                            continue
+                        
+                        mesh_instance_transformed = mesh_instance.copy()
+                        mesh_instance_transformed.apply_transform(transform)
+                        
+                        if not hasattr(mesh_instance_transformed, 'triangles') or len(mesh_instance_transformed.triangles) == 0:
+                            continue
+
+                        t_pts = hab_utils.dense_sampling_trimesh(mesh_instance_transformed.triangles, sampling_density)
+                        
+                        obj_color_index = sem_id - 2 
+                        color_for_obj = (0.5, 0.5, 0.5)
+                        if obj_color_index >= 0 and obj_color_index < len(CURRENT_OBJECT_COLORS_VIS):
+                            color_for_obj = CURRENT_OBJECT_COLORS_VIS[obj_color_index]
+                        elif sem_id < len(LEGEND_PALETTE_VIS):
+                             color_for_obj = LEGEND_PALETTE_VIS[sem_id]
+
+                        for t_pt in t_pts:
+                            vertices.append(t_pt); obj_ids_out.append(parsed_instance_id); sem_ids_out.append(sem_id); colors.append(list(color_for_obj))
+        except Exception as e:
+            logger.error(f"Error loading/processing HM3D GLB {os.path.basename(glb_path)} for object extraction: {e}", exc_info=True)
+    # ... (Keep Gibson/MP3D object extraction)
+
+    logger.info(f"Collected {len(vertices)} object vertices for {os.path.basename(glb_path)}.")
+
+    try:
+        hm3d_scene_dataset_config = None
+        if worker_active_dataset == "hm3d": # Use worker_active_dataset
+            scenes_root_parent_dir = os.path.abspath(os.path.join(SCENES_ROOT, ".."))
+            potential_config_names = [
+                "hm3d.scene_dataset_config.json",
+                "hm3d_annotated_basis.scene_dataset_config.json",
+                "hm3d_semantic.scene_dataset_config.json"
+            ]
+            for cfg_name in potential_config_names:
+                potential_cfg_path = os.path.join(scenes_root_parent_dir, cfg_name)
+                if os.path.isfile(potential_cfg_path):
+                    hm3d_scene_dataset_config = potential_cfg_path
+                    logger.info(f"Using HM3D scene dataset config: {hm3d_scene_dataset_config}")
+                    break
+            if not hm3d_scene_dataset_config:
+                 logger.warning(f"HM3D scene_dataset_config.json not found in {scenes_root_parent_dir} with common names. Sim might use defaults or fail for complex scenes.")
+
+        sim = hab_utils.robust_load_sim(glb_path, scene_dataset_config_file=hm3d_scene_dataset_config)
+        if sim is None: 
+            logger.error(f"Simulator could not be loaded for {os.path.basename(glb_path)}, cannot get navmesh.")
+            raise RuntimeError(f"Sim load failed for {glb_path}")
+
+        navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
+        if navmesh_triangles.size > 0:
+            t_pts_nav = hab_utils.dense_sampling_trimesh(navmesh_triangles, sampling_density)
+            nav_sem_id = CURRENT_OBJECT_CATEGORY_MAP.get("floor", 0)
+            nav_color_tuple = LEGEND_PALETTE_VIS[nav_sem_id] if nav_sem_id < len(LEGEND_PALETTE_VIS) else LEGEND_PALETTE_VIS[0]
+            nav_color = [float(c) for c in nav_color_tuple]
+            for t_pt in t_pts_nav:
+                vertices.append(t_pt); obj_ids_out.append(-1); sem_ids_out.append(nav_sem_id); colors.append(nav_color)
+            logger.debug(f"Collected {len(t_pts_nav)} navmesh vertices.")
+        else:
+            logger.warning(f"No navmesh vertices found for {os.path.basename(glb_path)}.")
+        sim.close()
+    except Exception as e:
+        logger.error(f"Error processing navmesh for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+    try:
+        per_floor_wall_pc = extract_wall_point_clouds(
+            glb_path, houses_dim_path, sampling_density=sampling_density
+        )
+
+        wall_sem_id = CURRENT_OBJECT_CATEGORY_MAP.get("wall", 1)
+        wall_color_tuple = LEGEND_PALETTE_VIS[wall_sem_id] if wall_sem_id < len(LEGEND_PALETTE_VIS) else LEGEND_PALETTE_VIS[0]
+        wall_color = [float(c) for c in wall_color_tuple]
+        num_wall_pts = 0
+        for _, points_on_floor in per_floor_wall_pc.items():
+            if points_on_floor.shape[0] > 0:
+                num_wall_pts += len(points_on_floor)
+                for p_wall in points_on_floor:
+                    vertices.append(p_wall); obj_ids_out.append(-1); sem_ids_out.append(wall_sem_id); colors.append(wall_color)
+        logger.debug(f"Collected {num_wall_pts} wall vertices.")
+    except Exception as e:
+        logger.error(f"Error processing walls for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+    if not vertices:
+        logger.warning(f"No vertices extracted at all for scene {os.path.basename(glb_path)}. Skipping save of H5 point cloud.")
+        return
+
+    vertices_arr = np.array(vertices)
+    obj_ids_arr = np.array(obj_ids_out)
+    sem_ids_arr = np.array(sem_ids_out)
+    colors_arr = np.array(colors)
+
+    try:
+        with h5py.File(pc_save_path, "w") as fp:
+            fp.create_dataset("vertices", data=vertices_arr)
+            fp.create_dataset("obj_ids", data=obj_ids_arr)
+            fp.create_dataset("sem_ids", data=sem_ids_arr)
+            fp.create_dataset("colors", data=colors_arr)
+        logger.info(f"Saved point cloud for {os.path.basename(glb_path)} to {pc_save_path} with {len(vertices_arr)} points.")
+    except Exception as e:
+        logger.error(f"Failed to save HDF5 point cloud for {os.path.basename(glb_path)}: {e}", exc_info=True)
+
+def _aux_fn(input_data_for_worker):
+    actual_function_to_call = input_data_for_worker[0]
+    args_for_actual_function = input_data_for_worker[1:]
+    return actual_function_to_call(*args_for_actual_function)
 
 
 def extract_wall_point_clouds(
@@ -664,67 +1178,244 @@ def convert_point_cloud_to_semantic_map(
 
 
 if __name__ == "__main__":
-    scene_paths = sorted(
-        glob.glob(
-            os.path.join(SCENES_ROOT, "**/*.glb"),
-            recursive=True,
-        )
-    )
-    # Select only scenes that have corresponding semantics
-    scene_paths = list(
-        filter(
-            lambda x: os.path.isfile(x.replace(".glb", "_semantic.ply")), scene_paths
-        )
-    )
-
-    # Select only scenes from the train and val splits
-    valid_scenes = (
-        SPLIT_SCENES[ACTIVE_DATASET]["train"] + SPLIT_SCENES[ACTIVE_DATASET]["val"]
-    )
-    scene_paths = list(
-        filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes, scene_paths)
-    )
-
-    print(f"Number of available scenes: {len(scene_paths)}")
-
-    context = mp.get_context("forkserver")
-    pool = context.Pool(NUM_WORKERS, maxtasksperchild=MAX_TASKS_PER_CHILD)
-
-    # Extract scene_boundaries
     os.makedirs(SB_SAVE_ROOT, exist_ok=True)
-    print("===========> Extracting scene boundaries")
-    inputs = []
-    for scene_path in scene_paths:
-        scene_name = os.path.basename(scene_path).split(".")[0]
-        save_path = os.path.join(SB_SAVE_ROOT, f"{scene_name}.json")
-        if not os.path.isfile(save_path):
-            inputs.append((scene_path, save_path))
-    _ = list(tqdm.tqdm(pool.imap(get_scene_boundaries, inputs), total=len(inputs)))
-
-    # Generate point-clouds for each scene
     os.makedirs(PC_SAVE_ROOT, exist_ok=True)
-    print("===========> Extracting point-clouds")
-    inputs = []
-    for scene_path in scene_paths:
-        ply_path = scene_path.replace(".glb", "_semantic.ply")
-        scn_path = scene_path.replace(".glb", ".scn")
-        scene_name = scene_path.split("/")[-1].split(".")[0]
-        pc_save_path = os.path.join(PC_SAVE_ROOT, f"{scene_name}.h5")
-        if not os.path.isfile(pc_save_path):
-            inputs.append(
-                (
-                    extract_scene_point_clouds,
-                    scene_path,
-                    ply_path,
-                    scn_path,
-                    os.path.join(SB_SAVE_ROOT, f"{scene_name}.json"),
-                    pc_save_path,
+    os.makedirs(SEM_SAVE_ROOT, exist_ok=True)
+
+    scene_paths_all_splits = []
+    semantic_annotation_paths_all_splits = []
+
+    if ACTIVE_DATASET == "hm3d":
+        logger.info(f"Starting HM3D scene discovery in SCENES_ROOT: {SCENES_ROOT}")
+        dataset_splits_to_process = SPLIT_SCENES.get(ACTIVE_DATASET, {})
+        
+        if not dataset_splits_to_process or \
+           (not dataset_splits_to_process.get("train", []) and not dataset_splits_to_process.get("val", [])):
+            logger.error(f"CRITICAL: No train/val scenes defined or lists are empty in poni/constants.py for HM3D under SPLIT_SCENES['hm3d']. Exiting.")
+            logger.info(f"Content of SPLIT_SCENES['hm3d']: {dataset_splits_to_process}")
+            try:
+                actual_dirs = [d for d in os.listdir(SCENES_ROOT) if os.path.isdir(os.path.join(SCENES_ROOT, d))]
+                logger.info(f"Actual directories found in {SCENES_ROOT}: {actual_dirs[:10]} (showing first 10)")
+            except FileNotFoundError:
+                logger.error(f"SCENES_ROOT directory {SCENES_ROOT} itself not found.")
+            exit(1)
+
+        for split_type in dataset_splits_to_process.keys(): 
+            scenes_in_this_split = dataset_splits_to_process.get(split_type, [])
+            if not scenes_in_this_split:
+                logger.info(f"No scenes defined for HM3D {split_type} split in poni/constants.py.")
+                continue
+            
+            logger.info(f"Looking for {len(scenes_in_this_split)} scenes in HM3D {split_type} split as defined in constants...")
+            logger.info(f"Scene IDs from constants for {split_type}: {scenes_in_this_split[:5]} (first 5)")
+            
+            for scene_id_folder_name in scenes_in_this_split: 
+                scene_folder_path = os.path.join(SCENES_ROOT, scene_id_folder_name)
+                logger.debug(f"Checking scene folder: {scene_folder_path}")
+
+                if not os.path.isdir(scene_folder_path):
+                    logger.warning(f"Scene folder not found: {scene_folder_path} (using scene ID '{scene_id_folder_name}' from constants)")
+                    continue
+
+                short_scene_id_match = re.match(r'^\d+-(.*)$', scene_id_folder_name)
+                if not short_scene_id_match:
+                    logger.warning(f"Could not parse short_scene_id from folder name: {scene_id_folder_name}. Using full name for files.")
+                    short_scene_id_for_filename = scene_id_folder_name
+                else:
+                    short_scene_id_for_filename = short_scene_id_match.group(1)
+                
+                logger.debug(f"Using short_scene_id '{short_scene_id_for_filename}' for files in folder '{scene_id_folder_name}'")
+
+                glb_file_found = None
+                potential_glb_filenames = [
+                    f"{short_scene_id_for_filename}.semantic.glb", 
+                    f"{short_scene_id_for_filename}.basis.glb",    
+                    f"{short_scene_id_for_filename}.glb"
+                ]
+                for glb_name_candidate in potential_glb_filenames:
+                    candidate_path = os.path.join(scene_folder_path, glb_name_candidate)
+                    if os.path.isfile(candidate_path):
+                        glb_file_found = candidate_path
+                        logger.debug(f"Found GLB for {scene_id_folder_name}: {glb_file_found}")
+                        break
+                
+                semantic_txt_file = os.path.join(scene_folder_path, f"{short_scene_id_for_filename}.semantic.txt")
+
+                if glb_file_found and os.path.isfile(semantic_txt_file):
+                    scene_paths_all_splits.append(glb_file_found)
+                    semantic_annotation_paths_all_splits.append(semantic_txt_file)
+                else:
+                    if not glb_file_found: logger.warning(f"HM3D GLB (any type using short_id '{short_scene_id_for_filename}') not found in {scene_folder_path}")
+                    if not os.path.isfile(semantic_txt_file): logger.warning(f"HM3D semantic.txt (using short_id '{short_scene_id_for_filename}') not found: {semantic_txt_file}")
+        
+        unique_glb_paths = sorted(list(set(scene_paths_all_splits)))
+        temp_semantic_map = {}
+        for p_sem_txt in semantic_annotation_paths_all_splits:
+            short_id_sem = os.path.basename(p_sem_txt).replace(".semantic.txt","")
+            temp_semantic_map[short_id_sem] = p_sem_txt
+        
+        final_semantic_paths = []
+        final_scene_paths = []
+
+        for glb_p in unique_glb_paths:
+            glb_basename = os.path.basename(glb_p)
+            short_id_glb_match = re.match(r'^([a-zA-Z0-9]+)', glb_basename) 
+            if short_id_glb_match:
+                short_id_glb = short_id_glb_match.group(1)
+                if short_id_glb in temp_semantic_map:
+                    final_semantic_paths.append(temp_semantic_map[short_id_glb])
+                    final_scene_paths.append(glb_p)
+                else:
+                    logger.warning(f"Alignment issue: Could not find matching semantic.txt for GLB: {glb_p} (extracted short_id: {short_id_glb}) using semantic map keys: {list(temp_semantic_map.keys())[:5]}")
+            else:
+                 logger.warning(f"Could not extract short_id from GLB filename: {glb_basename} to align with semantic.txt")
+
+        scene_paths_all_splits = final_scene_paths
+        semantic_annotation_paths_all_splits = final_semantic_paths
+
+    elif ACTIVE_DATASET == "gibson":
+        # (original Gibson path finding logic, adapted for SPLIT_SCENES)
+        scene_paths_all_splits = sorted(glob.glob(os.path.join(SCENES_ROOT, "*.glb")))
+        valid_scenes_for_split_gibson = []
+        for split_type_gibson in SPLIT_SCENES.get(ACTIVE_DATASET, {}).keys():
+            valid_scenes_for_split_gibson.extend(SPLIT_SCENES[ACTIVE_DATASET].get(split_type_gibson, []))
+        if valid_scenes_for_split_gibson: 
+            scene_paths_all_splits = list(
+                filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes_for_split_gibson, scene_paths_all_splits)
+            )
+        semantic_annotation_paths_all_splits = [p.replace(".glb", "_semantic.ply") for p in scene_paths_all_splits]
+        final_scene_paths = []
+        final_semantic_paths = []
+        for glb_p, sem_p in zip(scene_paths_all_splits, semantic_annotation_paths_all_splits):
+            if os.path.isfile(sem_p):
+                final_scene_paths.append(glb_p)
+                final_semantic_paths.append(sem_p)
+            else:
+                logger.warning(f"Gibson semantic PLY not found: {sem_p} for GLB {glb_p}")
+        scene_paths_all_splits = final_scene_paths
+        semantic_annotation_paths_all_splits = final_semantic_paths
+
+
+    elif ACTIVE_DATASET == "mp3d":
+        # (original MP3D path finding logic, adapted for SPLIT_SCENES)
+        scene_paths_all_splits = sorted(glob.glob(os.path.join(SCENES_ROOT, "**/*.glb"), recursive=True))
+        scene_paths_all_splits = list(filter(lambda x: os.path.basename(x).split(".")[0] != "prefetch_test_scene", scene_paths_all_splits))
+        valid_scenes_for_split_mp3d = []
+        for split_type_mp3d in SPLIT_SCENES.get(ACTIVE_DATASET, {}).keys():
+            valid_scenes_for_split_mp3d.extend(SPLIT_SCENES[ACTIVE_DATASET].get(split_type_mp3d, []))
+        if valid_scenes_for_split_mp3d: 
+             scene_paths_all_splits = list(
+                filter(lambda x: os.path.basename(x).split(".")[0] in valid_scenes_for_split_mp3d, scene_paths_all_splits)
+            )
+        semantic_annotation_paths_all_splits = [p.replace(".glb", ".scn") for p in scene_paths_all_splits]
+        final_scene_paths_mp3d = []
+        final_semantic_paths_mp3d = []
+        for glb_p, sem_p in zip(scene_paths_all_splits, semantic_annotation_paths_all_splits):
+            if os.path.isfile(sem_p):
+                final_scene_paths_mp3d.append(glb_p)
+                final_semantic_paths_mp3d.append(sem_p)
+            else:
+                logger.warning(f"MP3D .scn not found: {sem_p} for GLB {glb_p}")
+        scene_paths_all_splits = final_scene_paths_mp3d
+        semantic_annotation_paths_all_splits = final_semantic_paths_mp3d
+
+
+    logger.info(f"Found {len(scene_paths_all_splits)} scenes for {ACTIVE_DATASET} to process after filtering by splits and checking for semantic files.")
+    if not scene_paths_all_splits:
+        logger.error(f"CRITICAL: No scenes found to process for {ACTIVE_DATASET}. Check SCENES_ROOT ({SCENES_ROOT}), SPLIT_SCENES in poni/constants.py, and ensure semantic files exist and scene IDs match folder names. Exiting.")
+        exit(1)
+
+    # Stage 1: Extract scene_boundaries
+    logger.info("===========> Stage 1: Extracting scene boundaries <===========")
+    boundary_processing_list = [] 
+    for scene_path in scene_paths_all_splits:
+        scene_folder_name_for_boundary = os.path.basename(os.path.dirname(scene_path))
+        save_path = os.path.join(SB_SAVE_ROOT, f"{scene_folder_name_for_boundary}.json")
+        if not os.path.isfile(save_path):
+            boundary_processing_list.append( (get_scene_boundaries, (scene_path, save_path)) ) # Pass as a tuple for _aux_fn
+        else:
+            logger.info(f"Boundary file for {scene_folder_name_for_boundary} already exists at {save_path}, skipping.")
+
+
+    if boundary_processing_list:
+        logger.info(f"Found {len(boundary_processing_list)} scenes for boundary extraction.")
+        # Try 'spawn' context if 'forkserver' is problematic or unavailable, 'fork' is least safe with CUDA.
+        start_method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
+        logger.info(f"Using multiprocessing context for boundaries: {start_method}")
+        try:
+            ctx = mp.get_context(start_method)
+            with ctx.Pool(NUM_WORKERS, maxtasksperchild=MAX_TASKS_PER_CHILD) as pool:
+                list(tqdm.tqdm(pool.imap_unordered(_aux_fn, boundary_processing_list), total=len(boundary_processing_list), desc="Scene Boundaries"))
+        except Exception as e_pool:
+            logger.error(f"Multiprocessing pool for Scene Boundaries failed: {e_pool}", exc_info=True)
+            logger.info("Attempting serial execution for Scene Boundaries as a fallback...")
+            for item in tqdm.tqdm(boundary_processing_list, desc="Scene Boundaries (Serial Fallback)"):
+                try:
+                    _aux_fn(item)
+                except Exception as e_item:
+                    logger.error(f"Error processing item {item[1]} serially: {e_item}", exc_info=True)
+
+    else:
+        logger.info("All scene boundaries seem to be precomputed or no new scenes found for boundary extraction.")
+
+    # Stage 2: Generate point-clouds for each scene
+    logger.info("===========> Stage 2: Extracting point-clouds <===========")
+    pc_inputs = []
+    for i, scene_path_pc in enumerate(scene_paths_all_splits):
+        scene_folder_name_for_pc = os.path.basename(os.path.dirname(scene_path_pc))
+        pc_save_path_val = os.path.join(PC_SAVE_ROOT, f"{scene_folder_name_for_pc}.h5")
+        houses_dim_path_val = os.path.join(SB_SAVE_ROOT, f"{scene_folder_name_for_pc}.json")
+        
+        if i >= len(semantic_annotation_paths_all_splits):
+            logger.error(f"Mismatch between scene_paths and semantic_annotation_paths at index {i}. Skipping PC for {scene_folder_name_for_pc}")
+            continue
+        semantic_file_for_scene = semantic_annotation_paths_all_splits[i] 
+
+        if not os.path.isfile(houses_dim_path_val):
+            logger.warning(f"Skipping PC for {scene_folder_name_for_pc}, boundary file missing: {houses_dim_path_val}")
+            continue
+        if not os.path.isfile(pc_save_path_val):
+            pc_inputs.append(
+                ( 
+                    extract_scene_point_clouds, 
+                    scene_path_pc,               
+                    semantic_file_for_scene,    
+                    houses_dim_path_val,        
+                    pc_save_path_val,           
+                    SAMPLING_RESOLUTION         
                 )
             )
+        else:
+            logger.info(f"Point cloud for {scene_folder_name_for_pc} already exists at {pc_save_path_val}, skipping.")
 
-    _ = list(tqdm.tqdm(pool.imap(_aux_fn, inputs), total=len(inputs)))
+    if pc_inputs:
+        logger.info(f"Found {len(pc_inputs)} scenes for point cloud extraction.")
+        effective_num_workers_pc = min(NUM_WORKERS, len(pc_inputs))
+        if effective_num_workers_pc > 0:
+            start_method_pc = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
+            logger.info(f"Using multiprocessing context for point clouds: {start_method_pc}")
+            try:
+                ctx_pc = mp.get_context(start_method_pc)
+                with ctx_pc.Pool(effective_num_workers_pc, maxtasksperchild=MAX_TASKS_PER_CHILD) as pool:
+                    list(tqdm.tqdm(pool.imap_unordered(_aux_fn, pc_inputs), total=len(pc_inputs), desc="Point Clouds"))
+            except Exception as e_pool_pc:
+                logger.error(f"Multiprocessing pool for Point Clouds failed: {e_pool_pc}", exc_info=True)
+                logger.info("Attempting serial execution for Point Clouds as a fallback...")
+                for item_pc in tqdm.tqdm(pc_inputs, desc="Point Clouds (Serial Fallback)"):
+                    try:
+                        _aux_fn(item_pc)
+                    except Exception as e_item_pc:
+                        logger.error(f"Error processing item {item_pc[1]} serially: {e_item_pc}", exc_info=True)
+        else:
+            logger.info("No scenes to process for point cloud extraction after filtering.")
+    else:
+        logger.info("All point clouds seem to be precomputed or no new scenes found for point cloud extraction.")
 
-    # Extract semantic maps
-    os.makedirs(SEM_SAVE_ROOT, exist_ok=True)
-    print("===========> Extracting semantic maps")
-    convert_point_cloud_to_semantic_map(PC_SAVE_ROOT, SB_SAVE_ROOT, SEM_SAVE_ROOT)
+    # Stage 3: Extract semantic maps from point clouds
+    logger.info("===========> Stage 3: Extracting semantic maps <===========")
+    convert_point_cloud_to_semantic_map(
+        PC_SAVE_ROOT, SB_SAVE_ROOT, SEM_SAVE_ROOT,
+        resolution=0.05
+    )
+    logger.info("===========> Semantic map creation process finished. <===========")
+
