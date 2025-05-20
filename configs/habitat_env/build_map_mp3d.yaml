@@ -45,6 +45,6 @@ TASK:
   SUCCESS:
     SUCCESS_DISTANCE: 0.2
 DATASET:
-  TYPE: PointNav-v1
+  TYPE: ObjectNav-v1
   SPLIT: train
-  DATA_PATH: data/datasets/pointnav/mp3d/v1/{split}/{split}.json.gz
+  DATA_PATH: data/objectnav_hm3d_v1/{split}/{split}.json.gz
