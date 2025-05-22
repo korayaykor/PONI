@@ -775,7 +775,10 @@ def extract_wall_point_clouds(
     houses_dim_path,
     sampling_density=1600.0,
     grid_size=2.0,
+    current_wall_thresh=None # current_wall_thresh eklendi
 ):
+    if current_wall_thresh is None: # current_wall_thresh için varsayılan değer
+        current_wall_thresh = WALL_THRESH
     env = glb_path.split("/")[-1].split(".")[0]
 
     # Get house dimensions
@@ -788,68 +791,142 @@ def extract_wall_point_clouds(
             per_floor_dims[int(match.group(1))] = val
 
     # For each floor in the building, get (x, z) specific y-values for nav locations.
+    # BEGIN FIX
     sim = hab_utils.robust_load_sim(glb_path)
-    navmesh_triangles = np.array(sim.pathfinder.build_navmesh_vertices())
-    navmesh_vertices = hab_utils.dense_sampling_trimesh(
-        navmesh_triangles, sampling_density
-    )
+    navmesh_triangles_flat = np.array(sim.pathfinder.build_navmesh_vertices())
+
+    if navmesh_triangles_flat.size > 0 and navmesh_triangles_flat.size % 9 == 0:
+        navmesh_triangles_reshaped = navmesh_triangles_flat.reshape(-1, 3, 3)
+        navmesh_vertices = hab_utils.dense_sampling_trimesh(
+            navmesh_triangles_reshaped, sampling_density
+        )
+    elif navmesh_triangles_flat.size == 0:
+        logger.warning(f"No navmesh vertices found for {os.path.basename(glb_path)} in extract_wall_point_clouds.")
+        navmesh_vertices = np.array([])
+    else:
+        logger.error(f"Navmesh vertex data size {navmesh_triangles_flat.size} is not divisible by 9 for {os.path.basename(glb_path)}. Cannot form triangles.")
+        navmesh_vertices = np.array([])
+    # END FIX
     sim.close()
+
     per_floor_xz_map = {}
     nav_points_per_floor = {}
     for floor_id, floor_dims in per_floor_dims.items():
-        floor_navmesh_vertices = navmesh_vertices[
-            (navmesh_vertices[:, 1] >= floor_dims["ylo"])
-            & (navmesh_vertices[:, 1] < floor_dims["yhi"])
-        ]
-        nav_points_per_floor[floor_id] = floor_navmesh_vertices
-        # Divide into 0.5m x 0.5m grid cells
-        floor_x = np.rint(floor_navmesh_vertices[:, 0] / grid_size).astype(np.int32)
-        floor_z = np.rint(floor_navmesh_vertices[:, 2] / grid_size).astype(np.int32)
-        floor_y = floor_navmesh_vertices[:, 1]
-        floor_xz_sets = set(zip(floor_x, floor_z))
-        floor_xz_map = {}
-        for x, z in floor_xz_sets:
-            mask = (floor_x == x) & (floor_z == z)
-            floor_xz_map[(x, z)] = np.median(floor_y[mask])
-        per_floor_xz_map[floor_id] = floor_xz_map
+        # BEGIN FIX for potential IndexError on navmesh_vertices
+        if navmesh_vertices.ndim == 2 and navmesh_vertices.shape[0] > 0 and navmesh_vertices.shape[1] == 3:
+            floor_nav_mask = (navmesh_vertices[:, 1] >= floor_dims["ylo"]) & \
+                             (navmesh_vertices[:, 1] < floor_dims["yhi"])
+            floor_navmesh_vertices_on_this_floor = navmesh_vertices[floor_nav_mask]
+        else:
+            logger.warning(f"Sampled navmesh_vertices is not valid for floor {floor_id} in {env}. Shape: {navmesh_vertices.shape if isinstance(navmesh_vertices, np.ndarray) else type(navmesh_vertices)}")
+            floor_navmesh_vertices_on_this_floor = np.array([])
+        # END FIX
+
+        nav_points_per_floor[floor_id] = floor_navmesh_vertices_on_this_floor # Store the possibly empty array
+
+        # Ensure subsequent code correctly handles an empty floor_navmesh_vertices_on_this_floor
+        if floor_navmesh_vertices_on_this_floor.shape[0] > 0:
+            floor_x = np.rint(floor_navmesh_vertices_on_this_floor[:, 0] / grid_size).astype(np.int32)
+            floor_z = np.rint(floor_navmesh_vertices_on_this_floor[:, 2] / grid_size).astype(np.int32)
+            floor_y_coords = floor_navmesh_vertices_on_this_floor[:, 1] # Rename to avoid conflict with loop var
+            floor_xz_sets = set(zip(floor_x, floor_z))
+            current_floor_xz_map = {} # Use a temporary dict for the current floor
+            for x_coord, z_coord in floor_xz_sets: # Iterate using x_coord, z_coord
+                mask = (floor_x == x_coord) & (floor_z == z_coord)
+                current_floor_xz_map[(x_coord, z_coord)] = np.median(floor_y_coords[mask]) # Use floor_y_coords
+            per_floor_xz_map[floor_id] = current_floor_xz_map
+        else:
+            per_floor_xz_map[floor_id] = {}
+
 
     # Get all mesh triangles in the scene
     scene = trimesh.load(glb_path)
-    wall_pc = hab_utils.dense_sampling_trimesh(scene.triangles, sampling_density)
+    # It seems `scene.triangles` might not always be what's expected, ensure it's Nx3x3
+    wall_pc_candidate_triangles = scene.triangles
+    if wall_pc_candidate_triangles.ndim == 2 and wall_pc_candidate_triangles.shape[1] == 3: # If it's a list of vertices
+        if wall_pc_candidate_triangles.shape[0] % 3 == 0:
+             wall_pc_candidate_triangles = wall_pc_candidate_triangles.reshape(-1,3,3)
+        else:
+            logger.warning(f"Scene mesh for {glb_path} has {wall_pc_candidate_triangles.shape[0]} vertices, not divisible by 3 to form triangles. Skipping wall PC from this source.")
+            wall_pc_candidate_triangles= np.array([])
+
+
+    if wall_pc_candidate_triangles.ndim == 3 and wall_pc_candidate_triangles.shape[1:] == (3,3):
+        wall_pc = hab_utils.dense_sampling_trimesh(wall_pc_candidate_triangles, sampling_density)
+    else:
+        logger.warning(f"Scene mesh for {glb_path} does not provide triangles in expected Nx3x3 format. Shape: {wall_pc_candidate_triangles.shape}. Attempting to sample vertices directly if it's a point cloud.")
+        if isinstance(scene, trimesh.PointCloud) and scene.vertices.shape[0] > 0:
+            wall_pc = scene.vertices
+        elif isinstance(scene, trimesh.Trimesh) and scene.vertices.shape[0] > 0 and scene.faces.shape[0] == 0: # Vertices but no faces
+             wall_pc = scene.vertices
+        else:
+            wall_pc = np.array([])
+
+
     # Convert coordinate systems
-    wall_pc = np.stack([wall_pc[:, 0], wall_pc[:, 2], -wall_pc[:, 1]], axis=1)
+    if wall_pc.shape[0] > 0:
+        wall_pc = np.stack([wall_pc[:, 0], wall_pc[:, 2], -wall_pc[:, 1]], axis=1)
+    else:
+        logger.warning(f"No wall points to process for {glb_path} after trimesh load and sampling.")
 
     ############################################################################
     # Assign wall points to floors
     ############################################################################
     per_floor_point_clouds = defaultdict(list)
-    for floor_id, floor_dims in per_floor_dims.items():
-        # Identify points belonging to this floor
-        curr_floor_y = floor_dims["ylo"]
-        if floor_id + 1 in per_floor_dims:
-            next_floor_y = per_floor_dims[floor_id + 1]["ylo"]
-        else:
-            next_floor_y = math.inf
-        floor_mask = (curr_floor_y <= wall_pc[:, 1]) & (
-            wall_pc[:, 1] <= next_floor_y - 0.5
-        )
-        floor_pc = wall_pc[floor_mask, :]
-        floor_xz_map = per_floor_xz_map[floor_id]
-        # Decide whether each point is a wall point or not
-        floor_x_disc = np.around(floor_pc[:, 0] / grid_size).astype(np.int32)
-        floor_z_disc = np.around(floor_pc[:, 2] / grid_size).astype(np.int32)
-        floor_y = floor_pc[:, 1]
-        mask = np.zeros(floor_y.shape[0], dtype=np.bool_)
-        for i, (x_disc, z_disc, y) in enumerate(
-            zip(floor_x_disc, floor_z_disc, floor_y)
-        ):
-            floor_y = per_floor_dims[floor_id]["ylo"]
-            if (x_disc, z_disc) in floor_xz_map:
-                floor_y = floor_xz_map[(x_disc, z_disc)]
-            # Add point if within height thresholds
-            if WALL_THRESH[0] <= y - floor_y < WALL_THRESH[1]:
-                mask[i] = True
-        per_floor_point_clouds[floor_id] = floor_pc[mask]
+    if wall_pc.shape[0] > 0: # Proceed only if there are wall points
+        for floor_id, floor_dims in per_floor_dims.items():
+            # Identify points belonging to this floor
+            curr_floor_y_level = floor_dims["ylo"] # Use consistent naming
+            if floor_id + 1 in per_floor_dims:
+                next_floor_y_level = per_floor_dims[floor_id + 1]["ylo"]
+            else:
+                next_floor_y_level = math.inf # Use math.inf
+
+            # Ensure wall_pc has points before masking
+            if wall_pc.shape[0] == 0:
+                per_floor_point_clouds[floor_id] = np.array([])
+                continue
+
+            floor_mask = (curr_floor_y_level <= wall_pc[:, 1]) & \
+                         (wall_pc[:, 1] <= next_floor_y_level - 0.5)
+            
+            # Ensure floor_mask can be applied to wall_pc
+            if floor_mask.shape[0] != wall_pc.shape[0]:
+                logger.error(f"Shape mismatch: floor_mask ({floor_mask.shape}) vs wall_pc ({wall_pc.shape}) for floor {floor_id} in {env}. Skipping.")
+                per_floor_point_clouds[floor_id] = np.array([])
+                continue
+
+            current_floor_pc = wall_pc[floor_mask, :] # Use current_floor_pc
+            
+            # Ensure current_floor_pc has points before further processing
+            if current_floor_pc.shape[0] == 0:
+                per_floor_point_clouds[floor_id] = np.array([])
+                continue
+
+            floor_xz_map = per_floor_xz_map.get(floor_id, {}) # Get the map for current floor_id
+
+            # Decide whether each point is a wall point or not
+            # Use current_floor_pc for these calculations
+            floor_x_disc = np.around(current_floor_pc[:, 0] / grid_size).astype(np.int32)
+            floor_z_disc = np.around(current_floor_pc[:, 2] / grid_size).astype(np.int32)
+            floor_y_values = current_floor_pc[:, 1] # Use a different variable name
+            
+            height_mask = np.zeros(floor_y_values.shape[0], dtype=np.bool_) # Use height_mask
+            for i, (x_disc, z_disc, y_val) in enumerate( # Use y_val
+                zip(floor_x_disc, floor_z_disc, floor_y_values) # Use floor_y_values
+            ):
+                # floor_y_level_from_map = per_floor_dims[floor_id]["ylo"] # This was just ylo, not from xz_map
+                floor_y_level_from_map = floor_xz_map.get((x_disc, z_disc), per_floor_dims[floor_id]["ylo"])
+
+                # Add point if within height thresholds
+                # Use current_wall_thresh which was passed or defaulted from WALL_THRESH
+                if current_wall_thresh[0] <= y_val - floor_y_level_from_map < current_wall_thresh[1]:
+                    height_mask[i] = True # Use height_mask
+            per_floor_point_clouds[floor_id] = current_floor_pc[height_mask] # Use height_mask
+    else: # wall_pc was empty
+        for floor_id in per_floor_dims.keys():
+            per_floor_point_clouds[floor_id] = np.array([])
+
 
     return per_floor_point_clouds
 
@@ -919,6 +996,13 @@ def convert_point_cloud_to_semantic_map(
 ):
 
     obj_files = sorted(glob.glob(f"{pc_dir}/*.h5"))
+    if not obj_files:
+        logger.warning(f"No .h5 files found in point cloud directory: {pc_dir}")
+        # Initialize info here if it's used later, even if no files are processed
+        info = {} 
+        json.dump(info, open(os.path.join(save_dir, "semmap_GT_info.json"), "w"))
+        return
+
 
     info = {}
 
@@ -926,53 +1010,106 @@ def convert_point_cloud_to_semantic_map(
 
         env = obj_f.split("/")[-1].split(".")[0]
         map_save_path = os.path.join(save_dir, env + ".h5")
-        if os.path.isfile(map_save_path):
+        # if os.path.isfile(map_save_path): # If you need to reprocess, comment this out
+        #     logger.info(f"Semantic map for {env} already exists at {map_save_path}, skipping.")
+        #     # Load existing info if needed for the final JSON dump, or ensure keys are handled
+        #     # This part might need adjustment if you want to merge with existing info.json
+        #     try:
+        #         with open(os.path.join(save_dir, "semmap_GT_info.json"), "r") as f_info_existing:
+        #             existing_info_all = json.load(f_info_existing)
+        #             if env in existing_info_all:
+        #                  info[env] = existing_info_all[env] # Preserve existing info for skipped files
+        #     except FileNotFoundError:
+        #         pass # No existing info file, it's fine
+        #     except json.JSONDecodeError:
+        #         logger.warning(f"Could not parse existing semmap_GT_info.json, will overwrite.")
+        #     continue
+
+
+        houses_dim_json_path = os.path.join(houses_dim_root, env + ".json")
+        if not os.path.exists(houses_dim_json_path):
+            logger.warning(f"Dimension file {houses_dim_json_path} not found for scene {env}. Skipping semantic map creation for this scene.")
+            info[env] = {"error": f"Dimension JSON file not found at {houses_dim_json_path}"}
             continue
 
-        with open(os.path.join(houses_dim_root, env + ".json"), "r") as fp:
-            houses_dim = json.load(fp)
+        try:
+            with open(houses_dim_json_path, "r") as fp:
+                houses_dim = json.load(fp)
+        except json.JSONDecodeError:
+            logger.error(f"Error decoding JSON from {houses_dim_json_path} for scene {env}. Skipping.")
+            info[env] = {"error": f"Could not decode dimension JSON file {houses_dim_json_path}"}
+            continue
+
+
+        # Check if the main environment key exists in houses_dim
+        if env not in houses_dim:
+            logger.error(f"Key '{env}' (overall scene bounds) not found in dimension file {houses_dim_json_path}. Scene: {env}. This scene might have had issues during boundary extraction (Stage 1). Skipping semantic map creation for this scene.")
+            info[env] = {"error": f"Key '{env}' for overall scene bounds not found in its dimension JSON file."}
+            continue # Skip to the next scene
+
+        # --  set discret dimensions
+        try:
+            # This is where the original KeyError occurred
+            center = np.array(houses_dim[env]["center"])
+            sizes = np.array(houses_dim[env]["sizes"])
+        except KeyError as e:
+            logger.error(f"Missing 'center' or 'sizes' for key '{env}' in {houses_dim_json_path}. Content for key '{env}': {houses_dim.get(env)}. Error: {e}. Skipping scene {env}.")
+            info[env] = {"error": f"Missing 'center' or 'sizes' for key '{env}' in its dimension JSON file."}
+            continue
+        except TypeError as e: # Handles if houses_dim[env] is not a dict (e.g. None or other type)
+            logger.error(f"Data for key '{env}' in {houses_dim_json_path} is not a dictionary or is malformed. Content: {houses_dim.get(env)}. Error: {e}. Skipping scene {env}.")
+            info[env] = {"error": f"Data for key '{env}' in dimension JSON file is malformed."}
+            continue
+
+
         f = h5py.File(obj_f, "r")
 
         # Generate floor-wise maps
         per_floor_dims = {}
         for key, val in houses_dim.items():
-            match = re.search(f"{env}_(\d+)", key)
+            # Match keys like "scene_id_0", "scene_id_1", etc. for floors
+            # env here is the base scene_id (e.g., "00006-HkseAnWCgqk")
+            match = re.search(f"^{re.escape(env)}_(\d+)$", key) # Ensure it matches keys like "env_0", "env_1"
             if match:
-                per_floor_dims[int(match.group(1))] = val
+                floor_num = int(match.group(1))
+                # Ensure 'val' is a dictionary and contains 'ylo' before using it
+                if isinstance(val, dict) and "ylo" in val:
+                    per_floor_dims[floor_num] = val
+                else:
+                    logger.warning(f"Floor key '{key}' in {houses_dim_json_path} does not have expected dictionary structure or 'ylo'. Skipping this floor entry.")
+
 
         all_vertices = np.array(f["vertices"])
         all_obj_ids = np.array(f["obj_ids"])
         all_sem_ids = np.array(f["sem_ids"])
-        all_colors = np.array(f["colors"])
+        # all_colors = np.array(f["colors"]) # Not used in this function currently
 
         f.close()
 
-        # --- change coordinates to match map
+        # -- change coordinates to match map
         # --  set discret dimensions
-        center = np.array(houses_dim[env]["center"])
-        sizes = np.array(houses_dim[env]["sizes"])
-        sizes += 2  # -- pad env bboxes
 
         world_dim = sizes.copy()
-        world_dim[1] = 0
+        # world_dim[1] = 0 # Y dimension (height) of the overall box is in sizes[1]
 
         central_pos = center.copy()
-        central_pos[1] = 0
+        # central_pos[1] = 0 # Y coordinate of the center is center[1]
 
-        map_world_shift = central_pos - world_dim / 2
+        map_world_shift = central_pos - world_dim / 2.0 # Element-wise subtraction
 
         world_dim_discret = [
-            int(np.round(world_dim[0] / resolution)),
-            0,
-            int(np.round(world_dim[2] / resolution)),
+            int(np.round(world_dim[0] / resolution)), # X size
+            0, # Placeholder for Y, as map is 2D (X,Z) projection
+            int(np.round(world_dim[2] / resolution)), # Z size
         ]
 
-        info[env] = {
+        current_scene_info = { # Store info for the current scene under its 'env' key
             "dim": world_dim_discret,
-            "central_pos": [float(x) for x in central_pos],
-            "map_world_shift": [float(x) for x in map_world_shift],
+            "central_pos": [float(c) for c in central_pos],
+            "map_world_shift": [float(s) for s in map_world_shift],
             "resolution": resolution,
         }
+
 
         # Pre-assign objects to different floors
         per_floor_obj_ids = {floor_id: [] for floor_id in per_floor_dims.keys()}
@@ -980,201 +1117,240 @@ def convert_point_cloud_to_semantic_map(
         ## -1 corresponds to wall and floor
         if -1 in obj_ids_set:
             obj_ids_set.remove(-1)
-        for obj_id in obj_ids_set:
-            is_obj_id = all_obj_ids == obj_id
+        
+        for obj_id_val in obj_ids_set: # Renamed to avoid conflict
+            is_obj_id = all_obj_ids == obj_id_val
+            if not np.any(is_obj_id): continue # Should not happen if obj_id_val is from obj_ids_set
+
             obj_vertices = all_vertices[is_obj_id, :]
-            # Get extents
+            if obj_vertices.shape[0] == 0: continue
+
             min_y = obj_vertices[:, 1].min()
-            # Assign object to floor closest to it's min_y
             best_floor_id = None
             best_diff = math.inf
-            for floor_id, floor_dims in per_floor_dims.items():
-                diff = abs(min_y - floor_dims["ylo"])
-                if (diff < best_diff) and min_y - floor_dims["ylo"] > -0.5:
+            for floor_id_loop, floor_dims_loop in per_floor_dims.items(): # Renamed loop vars
+                # Ensure floor_dims_loop is a dict and has 'ylo'
+                if not (isinstance(floor_dims_loop, dict) and "ylo" in floor_dims_loop):
+                    logger.warning(f"Floor {floor_id_loop} in {env} has malformed dimensions: {floor_dims_loop}. Skipping object assignment for this floor.")
+                    continue
+
+                diff = abs(min_y - floor_dims_loop["ylo"])
+                if (diff < best_diff) and min_y - floor_dims_loop["ylo"] > -0.5: # Object slightly below floor is ok
                     best_diff = diff
-                    best_floor_id = floor_id
+                    best_floor_id = floor_id_loop
+            
             if best_floor_id is None:
-                # Skip the object if it does not belong to any floor
-                # Print message for debugging purposes
-                print(
-                    f"NOTE: Object id {obj_id} from scene {env} does not belong to any floor!"
+                logger.warning(
+                    f"NOTE: Object id {obj_id_val} from scene {env} (min_y: {min_y:.2f}) does not belong to any defined floor. Floors: {per_floor_dims}"
                 )
                 continue
-            per_floor_obj_ids[best_floor_id].append(obj_id)
+            per_floor_obj_ids[best_floor_id].append(obj_id_val)
 
         # Build maps per floor
         per_floor_maps = {}
         for floor_id, floor_dims in per_floor_dims.items():
+            # Ensure floor_dims is a dict and has 'ylo' (already checked for per_floor_obj_ids assignment, but good practice)
+            if not (isinstance(floor_dims, dict) and "ylo" in floor_dims):
+                logger.warning(f"Skipping floor {floor_id} for map generation in {env} due to malformed floor_dims: {floor_dims}")
+                current_scene_info[floor_id] = {"error": "Malformed floor dimensions"}
+                continue
 
             curr_floor_y = floor_dims["ylo"]
-            if floor_id + 1 in per_floor_dims:
+            if floor_id + 1 in per_floor_dims and isinstance(per_floor_dims[floor_id+1], dict) and "ylo" in per_floor_dims[floor_id+1] :
                 next_floor_y = per_floor_dims[floor_id + 1]["ylo"]
             else:
                 next_floor_y = math.inf
 
             # Get navigable and wall vertices based on height thresholds
-            is_on_floor = (all_vertices[:, 1] >= curr_floor_y) & (
-                all_vertices[:, 1] <= next_floor_y - 0.5
-            )
-            is_floor = (all_sem_ids == OBJECT_CATEGORY_MAP["floor"]) & is_on_floor
-            is_wall = (all_sem_ids == OBJECT_CATEGORY_MAP["wall"]) & is_on_floor
+            is_on_floor_height_wise = (all_vertices[:, 1] >= curr_floor_y) & \
+                                     (all_vertices[:, 1] <= next_floor_y - 0.5)
+            
+            is_floor_semantic = (all_sem_ids == CURRENT_OBJECT_CATEGORY_MAP["floor"])
+            is_wall_semantic = (all_sem_ids == CURRENT_OBJECT_CATEGORY_MAP["wall"])
+
+            is_floor = is_floor_semantic & is_on_floor_height_wise
+            is_wall = is_wall_semantic & is_on_floor_height_wise
+
 
             # Get object vertices based on height thresholds for individual object instances
-            is_object = np.zeros_like(is_on_floor)
-            for obj_id in per_floor_obj_ids[floor_id]:
-                is_object = is_object | (all_obj_ids == obj_id)
+            is_object = np.zeros_like(all_obj_ids, dtype=bool) # Initialize as boolean
+            for obj_id_val_floor in per_floor_obj_ids.get(floor_id, []): # Use .get for safety
+                is_object = is_object | (all_obj_ids == obj_id_val_floor)
+            
+            is_object = is_object & is_on_floor_height_wise # Objects also need to be within floor height range
 
             mask = is_floor | is_wall | is_object
 
-            vertices = np.copy(all_vertices[mask])
-            obj_ids = np.copy(all_obj_ids[mask])
-            sem_ids = np.copy(all_sem_ids[mask])
+            vertices_this_floor = np.copy(all_vertices[mask])
+            obj_ids_this_floor = np.copy(all_obj_ids[mask])
+            sem_ids_this_floor = np.copy(all_sem_ids[mask])
+
 
             # -- some maps have 0 obj of interest
-            if len(vertices) == 0:
-                info[env][floor_id] = {"y_min": 0.0}
-                dims = (world_dim_discret[2], world_dim_discret[0])
-                mask = np.zeros(dims, dtype=bool)
-                map_z = np.zeros(dims, dtype=np.float32)
-                map_instance = np.zeros(dims, dtype=np.int32)
-                map_semantic = np.zeros(dims, dtype=np.int32)
-                map_semantic_rgb = np.zeros((*dims, 3), dtype=np.uint8)
+            if len(vertices_this_floor) == 0:
+                logger.warning(f"No vertices found for floor {floor_id} in scene {env} after filtering. Map will be empty.")
+                current_scene_info[str(floor_id)] = {"y_min": float(curr_floor_y)} # Use curr_floor_y as fallback
+                dims = (world_dim_discret[2], world_dim_discret[0]) # Z, X
+                # ... (rest of the empty map creation logic)
+                map_semantic_empty = np.zeros(dims, dtype=np.int32)
                 per_floor_maps[floor_id] = {
-                    "mask": mask,
-                    "map_z": map_z,
-                    "map_instance": map_instance,
-                    "map_semantic": map_semantic,
-                    "map_semantic_rgb": map_semantic_rgb,
+                    "mask": np.zeros(dims, dtype=bool),
+                    "map_z": np.zeros(dims, dtype=np.float32),
+                    "map_instance": np.zeros(dims, dtype=np.int32),
+                    "map_semantic": map_semantic_empty,
+                    "map_semantic_rgb": visualize_sem_map(map_semantic_empty),
                 }
                 continue
 
-            vertices -= map_world_shift
+            vertices_this_floor_shifted = vertices_this_floor - map_world_shift
 
             # Set the min_y for the floor. This will be used during episode generation to find
             # a random navigable start location.
-            floor_mask = sem_ids == OBJECT_CATEGORY_MAP["floor"]
-            min_y = vertices[floor_mask, 1].min()
-            info[env][floor_id] = {"y_min": float(min_y.item())}
+            floor_mask_for_min_y = sem_ids_this_floor == CURRENT_OBJECT_CATEGORY_MAP["floor"]
+            if np.any(floor_mask_for_min_y):
+                 min_y_this_floor = vertices_this_floor_shifted[floor_mask_for_min_y, 1].min()
+            else: # No floor points, use the nominal ylo for this floor
+                 min_y_this_floor = curr_floor_y - map_world_shift[1] # Adjust by shift
+            current_scene_info[str(floor_id)] = {"y_min": float(min_y_this_floor)}
+
 
             # Reduce heights of floor and navigable space to ensure objects are taller.
-            wall_mask = sem_ids == OBJECT_CATEGORY_MAP["wall"]
-            vertices[wall_mask, 1] -= 0.5
-            vertices[floor_mask, 1] -= 0.5
+            wall_mask_on_floor = sem_ids_this_floor == CURRENT_OBJECT_CATEGORY_MAP["wall"]
+            vertices_this_floor_shifted[wall_mask_on_floor, 1] -= 0.5 
+            vertices_this_floor_shifted[floor_mask_for_min_y, 1] -= 0.5 
+
 
             # -- discretize point cloud
-            vertices = torch.FloatTensor(vertices)
-            obj_ids = torch.FloatTensor(obj_ids)
-            sem_ids = torch.FloatTensor(sem_ids)
+            vertices_torch = torch.FloatTensor(vertices_this_floor_shifted)
+            obj_ids_torch = torch.FloatTensor(obj_ids_this_floor) # Keep as float for scatter_max if IDs can be non-int for some reason
+            sem_ids_torch = torch.FloatTensor(sem_ids_this_floor)
 
-            y_values = vertices[:, 1]
+            y_values_torch = vertices_torch[:, 1]
 
-            vertex_to_map_x = (vertices[:, 0] / resolution).round()
-            vertex_to_map_z = (vertices[:, 2] / resolution).round()
+            vertex_to_map_x = (vertices_torch[:, 0] / resolution).round()
+            vertex_to_map_z = (vertices_torch[:, 2] / resolution).round() # Z dimension is mapped to map rows
 
+            # Boundary checks for map coordinates
             outside_map_indices = (
-                (vertex_to_map_x >= world_dim_discret[0])
-                + (vertex_to_map_z >= world_dim_discret[2])
-                + (vertex_to_map_x < 0)
-                + (vertex_to_map_z < 0)
+                (vertex_to_map_x >= world_dim_discret[0]) | # X-size of map
+                (vertex_to_map_z >= world_dim_discret[2]) | # Z-size of map (which is map height)
+                (vertex_to_map_x < 0) |
+                (vertex_to_map_z < 0)
             )
+            
+            if torch.any(outside_map_indices):
+                logger.debug(f"Scene {env}, floor {floor_id}: {outside_map_indices.sum().item()} points are outside map discret bounds. Clamping them.")
+                # Clamp points to be within map boundaries to avoid scatter_max errors
+                # This is a simple way to handle it; ideally, points exactly on far boundary might need care
+                vertex_to_map_x = torch.clamp(vertex_to_map_x, 0, world_dim_discret[0] - 1)
+                vertex_to_map_z = torch.clamp(vertex_to_map_z, 0, world_dim_discret[2] - 1)
 
-            # assert outside_map_indices.sum() == 0
-            y_values = y_values[~outside_map_indices]
+
+            y_values_torch = y_values_torch[~outside_map_indices]
             vertex_to_map_z = vertex_to_map_z[~outside_map_indices]
             vertex_to_map_x = vertex_to_map_x[~outside_map_indices]
+            obj_ids_torch = obj_ids_torch[~outside_map_indices]
+            sem_ids_torch = sem_ids_torch[~outside_map_indices]
+            
+            if y_values_torch.numel() == 0: # No points left after filtering
+                logger.warning(f"No valid points left for floor {floor_id} in scene {env} after boundary check. Map will be empty.")
+                current_scene_info[str(floor_id)]["warning"] = "No valid points after boundary check"
+                dims = (world_dim_discret[2], world_dim_discret[0])
+                map_semantic_empty = np.zeros(dims, dtype=np.int32)
+                per_floor_maps[floor_id] = {
+                    "mask": np.zeros(dims, dtype=bool),
+                    "map_z": np.zeros(dims, dtype=np.float32),
+                    "map_instance": np.zeros(dims, dtype=np.int32),
+                    "map_semantic": map_semantic_empty,
+                    "map_semantic_rgb": visualize_sem_map(map_semantic_empty),
+                }
+                continue
 
-            obj_ids = obj_ids[~outside_map_indices]
-            sem_ids = sem_ids[~outside_map_indices]
 
             # -- get the z values for projection
-            # -- shift to positive values
-            y_values = y_values - min_y
-            y_values += 1.0
+            # -- shift to positive values (relative to this floor's min_y, which is now 0 after y_values_torch -= min_y_torch)
+            min_y_torch_val = y_values_torch.min() # min height of points on this floor, already shifted relative to map_world_shift
+            y_values_torch_proj = y_values_torch - min_y_torch_val # Make smallest height on this slice effectively 0 for projection ranking
+            y_values_torch_proj += 1.0 # Ensure all are >0 for scatter_max
 
             # -- projection
+            # map is (map_height_Z, map_width_X)
+            # world_dim_discret[2] is map height (from Z dimension)
+            # world_dim_discret[0] is map width (from X dimension)
             feat_index = (
-                world_dim_discret[0] * vertex_to_map_z + vertex_to_map_x
+                world_dim_discret[0] * vertex_to_map_z + vertex_to_map_x # row-major index from (z_map_coord, x_map_coord)
             ).long()
-            flat_highest_z = torch.zeros(
-                int(world_dim_discret[0] * world_dim_discret[2])
-            )
+
+            flat_map_size = int(world_dim_discret[0] * world_dim_discret[2])
+            
+            flat_highest_z = torch.zeros(flat_map_size, device=vertices_torch.device)
             flat_highest_z, argmax_flat_spatial_map = scatter_max(
-                y_values,
+                y_values_torch_proj, # Use relative heights for projection ranking
                 feat_index,
                 dim=0,
                 out=flat_highest_z,
             )
-            # NOTE: This is needed only for torch_scatter>=2.3
-            argmax_flat_spatial_map[argmax_flat_spatial_map == y_values.shape[0]] = -1
+            
+            argmax_flat_spatial_map[argmax_flat_spatial_map == y_values_torch_proj.shape[0]] = -1 # Handle out-of-bounds from scatter_max
 
-            m = argmax_flat_spatial_map >= 0
-            flat_map_instance = (
-                torch.zeros(int(world_dim_discret[0] * world_dim_discret[2])) - 1
-            )
+            m = argmax_flat_spatial_map >= 0 # Mask for valid indices from scatter_max
+            
+            flat_map_instance = torch.full((flat_map_size,), -1, dtype=torch.float32, device=vertices_torch.device) # Default to -1
+            if m.any():
+                flat_map_instance[m.view(-1)] = obj_ids_torch[argmax_flat_spatial_map[m]]
 
-            flat_map_instance[m.view(-1)] = obj_ids[argmax_flat_spatial_map[m]]
+            flat_map_semantic = torch.zeros(flat_map_size, dtype=torch.float32, device=vertices_torch.device) # Default to 0 (e.g. floor or out-of-bounds if not set)
+            if m.any():
+                flat_map_semantic[m.view(-1)] = sem_ids_torch[argmax_flat_spatial_map[m]]
 
-            flat_map_semantic = torch.zeros(
-                int(world_dim_discret[0] * world_dim_discret[2])
-            )
-            flat_map_semantic[m.view(-1)] = sem_ids[argmax_flat_spatial_map[m]]
 
             # -- format data
-            mask = m.reshape(world_dim_discret[2], world_dim_discret[0])
-            mask = mask.numpy()
-            mask = mask.astype(bool)
-            map_z = flat_highest_z.reshape(world_dim_discret[2], world_dim_discret[0])
-            map_z = map_z.numpy()
-            map_z = map_z.astype(np.float32)
-            map_instance = flat_map_instance.reshape(
-                world_dim_discret[2], world_dim_discret[0]
-            )
-            map_instance = map_instance.numpy()
-            map_instance = map_instance.astype(np.float32)
-            map_semantic = flat_map_semantic.reshape(
-                world_dim_discret[2], world_dim_discret[0]
-            )
-            map_semantic = map_semantic.numpy()
-            map_semantic = map_semantic.astype(np.float32)
-            map_semantic_rgb = visualize_sem_map(map_semantic)
+            map_shape_z_x = (world_dim_discret[2], world_dim_discret[0])
+
+            mask_np = m.reshape(map_shape_z_x).cpu().numpy().astype(bool)
+            map_z_np = flat_highest_z.reshape(map_shape_z_x).cpu().numpy().astype(np.float32)
+            map_z_np[mask_np] += min_y_torch_val.cpu().numpy() # Add back the min_y offset to get original shifted heights
+            map_z_np[~mask_np] = 0 # Or some other indicator for non-projected cells
+
+            map_instance_np = flat_map_instance.reshape(map_shape_z_x).cpu().numpy().astype(np.int32)
+            map_semantic_np = flat_map_semantic.reshape(map_shape_z_x).cpu().numpy().astype(np.int32)
+            map_semantic_rgb_np = visualize_sem_map(map_semantic_np)
 
             per_floor_maps[floor_id] = {
-                "mask": mask,
-                "map_z": map_z,
-                "map_instance": map_instance,
-                "map_semantic": map_semantic,
-                "map_semantic_rgb": map_semantic_rgb,
+                "mask": mask_np,
+                "map_z": map_z_np,
+                "map_instance": map_instance_np,
+                "map_semantic": map_semantic_np,
+                "map_semantic_rgb": map_semantic_rgb_np,
             }
 
             rgb_save_path = os.path.join(save_dir, f"{env}_{floor_id}.png")
-            cv2.imwrite(rgb_save_path, map_semantic_rgb)
+            cv2.imwrite(rgb_save_path, map_semantic_rgb_np) # Use BGR for cv2
+        
+                                info[env] = current_scene_info # Save the collected info for this scene (env)
 
-        with h5py.File(map_save_path, "w") as f:
-            f.create_dataset(f"wall_sem_id", data=OBJECT_CATEGORY_MAP["wall"])
-            f.create_dataset(f"floor_sem_id", data=OBJECT_CATEGORY_MAP["floor"])
-            f.create_dataset(
-                f"out-of-bounds_sem_id", data=OBJECT_CATEGORY_MAP["out-of-bounds"]
-            )
-            for floor_id, floor_map in per_floor_maps.items():
-                mask = floor_map["mask"]
-                map_z = floor_map["map_z"]
-                map_instance = floor_map["map_instance"]
-                map_semantic = floor_map["map_semantic"]
-                map_semantic_rgb = floor_map["map_semantic_rgb"]
+        with h5py.File(map_save_path, "w") as f_h5: # Use f_h5
+            # Ensure "floor" and "wall" and "out-of-bounds" exist in CURRENT_OBJECT_CATEGORY_MAP
+            f_h5.create_dataset(f"wall_sem_id", data=CURRENT_OBJECT_CATEGORY_MAP.get("wall", 1)) # Default to 1 if not found
+            f_h5.create_dataset(f"floor_sem_id", data=CURRENT_OBJECT_CATEGORY_MAP.get("floor", 0)) # Default to 0
+            f_h5.create_dataset(f"out-of-bounds_sem_id", data=CURRENT_OBJECT_CATEGORY_MAP.get("out-of-bounds", -1)) # Or another suitable default
 
-                f.create_dataset(f"{floor_id}/mask", data=mask, dtype=bool)
-                f.create_dataset(
-                    f"{floor_id}/map_heights", data=map_z, dtype=np.float32
-                )
-                f.create_dataset(
-                    f"{floor_id}/map_instance", data=map_instance, dtype=np.int32
-                )
-                f.create_dataset(
-                    f"{floor_id}/map_semantic", data=map_semantic, dtype=np.int32
-                )
-                f.create_dataset(f"{floor_id}/map_semantic_rgb", data=map_semantic_rgb)
+            for floor_id_save, floor_map_save in per_floor_maps.items(): # Use new loop vars
+                grp = f_h5.create_group(str(floor_id_save)) # Group by floor_id string
+                grp.create_dataset("mask", data=floor_map_save["mask"], dtype=bool)
+                grp.create_dataset("map_heights", data=floor_map_save["map_z"], dtype=np.float32)
+                grp.create_dataset("map_instance", data=floor_map_save["map_instance"], dtype=np.int32)
+                grp.create_dataset("map_semantic", data=floor_map_save["map_semantic"], dtype=np.int32)
+                grp.create_dataset("map_semantic_rgb", data=floor_map_save["map_semantic_rgb"])
 
-    json.dump(info, open(os.path.join(save_dir, "semmap_GT_info.json"), "w"))
+
+    json_info_path = os.path.join(save_dir, "semmap_GT_info.json")
+    try:
+        with open(json_info_path, "w") as fp_json:
+             json.dump(info, fp_json, indent=4)
+        logger.info(f"Successfully wrote semantic map GT info to {json_info_path}")
+    except Exception as e_json:
+        logger.error(f"Failed to write semantic map GT info to {json_info_path}: {e_json}", exc_info=True)
 
 
 if __name__ == "__main__":
