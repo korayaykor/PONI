@@ -90,6 +90,8 @@ pip install -r requirements.txt
 
 Add repository to python path:
 ```
+export PONI_ROOT=~/projects/PONI
+
 export PYTHONPATH=$PYTHONPATH:$PONI_ROOT
 ```
 ## UPLOADING semantic map datasets and datasets
